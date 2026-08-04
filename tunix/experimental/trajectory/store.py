@@ -71,11 +71,11 @@ class TrajectoryWriter(Protocol):
       step: trajectory_lib.Step,
       metadata: trajectory_lib.TrajectoryMetadata,
   ) -> None:
-    """Logs a turn step and its trajectory metadata.
+    """Logs a turn step and its accompanying trajectory metadata.
 
-    Depending on the backend implementation, writes may be queued
-    asynchronously. Readers never observe partially written or inconsistent
-    state.
+    The step and trajectory metadata are written together so that readers
+    observe updated state. Storage backends may provide atomic or best-effort
+    consistency depending on the underlying filesystem or database.
 
     Implementations snapshot `step` and `metadata` at call time, so callers may
     keep mutating those objects afterwards without affecting what was logged.

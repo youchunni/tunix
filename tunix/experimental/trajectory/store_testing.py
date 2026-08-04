@@ -215,6 +215,24 @@ class TrajectoryWriterTestCase(
         [trajectory_testing.TRAJECTORY_1, trajectory_testing.TRAJECTORY_2],
     )
 
+  def test_add_step_overwrite_existing_step(self) -> None:
+    """Tests that logging a step with an existing step_id updates the step."""
+    self.writer.add_step(
+        trajectory_testing.STEP_1_1, trajectory_testing.METADATA_1
+    )
+    self.writer.flush()
+
+    updated_step = trajectory_testing.STEP_1_1.model_copy(deep=True)
+    updated_step.message = "updated message"
+    self.writer.add_step(updated_step, trajectory_testing.METADATA_1)
+    self.writer.flush()
+
+    (traj_1,) = self.reader.get_trajectories(
+        [trajectory_testing.TRAJECTORY_ID_1]
+    )
+    self.assertLen(traj_1.steps, 1)
+    self.assertEqual(traj_1.steps[0].message, "updated message")
+
   def test_flush_empty(self) -> None:
     """Tests that calling flush on an empty store does not raise an error."""
     self.writer.flush()
@@ -340,3 +358,31 @@ class TrajectoryWriterTestCase(
     )
     with self.assertRaises(ValueError):
       self.writer.update_metadata(meta)
+
+  def test_subagent_trajectories_persistence(self) -> None:
+    """Tests that subagent trajectories round-trip properly."""
+    subagent_traj = trajectory_lib.Trajectory(
+        trajectory_id="sub_1",
+        agent=trajectory_lib.Agent(name="sub_agent", version="1.0"),
+        steps=[
+            trajectory_lib.Step(
+                step_id=0,
+                source=trajectory_lib.Source.AGENT,
+                message="Subagent action",
+            )
+        ],
+    )
+    meta = trajectory_lib.TrajectoryMetadata(
+        trajectory_id="parent_traj_1",
+        agent=trajectory_lib.Agent(name="parent_agent", version="1.0"),
+    )
+    step = trajectory_lib.Step(
+        step_id=0,
+        source=trajectory_lib.Source.AGENT,
+        message="Parent delegation",
+    )
+    self.writer.add_step(step, meta)
+    self.writer.flush()
+
+    (loaded_traj,) = self.reader.get_trajectories(["parent_traj_1"])
+    self.assertEqual(loaded_traj.steps[0].message, "Parent delegation")

@@ -18,12 +18,12 @@
   },
   "steps": [
     {
-      "step_id": 1,
+      "step_id": 0,
       "source": "user",
       "message": "List directory contents"
     },
     {
-      "step_id": 2,
+      "step_id": 1,
       "source": "agent",
       "model_name": "gemini-1.5-pro",
       "reasoning_effort": 1.0,

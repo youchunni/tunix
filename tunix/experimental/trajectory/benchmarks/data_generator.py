@@ -78,7 +78,7 @@ def generate_trajectories(
           source=trajectory_lib.Source.USER,
           message=payload,
       )
-      for step_id in range(1, workload.steps_per_trajectory + 1)
+      for step_id in range(workload.steps_per_trajectory)
   ]
 
   for traj_idx in range(1, total_count + 1):

@@ -129,8 +129,11 @@ class FileTrajectoryStoreTest(parameterized.TestCase):
     )
     meta_path.unlink()
 
-    with self.assertRaises(store.TrajectoryMetadataNotFoundError):
+    with self.assertRaises(store.TrajectoryMetadataNotFoundError) as ctx:
       self.file_s.get_trajectories_metadata()
+    self.assertEqual(
+        ctx.exception.trajectory_id, trajectory_testing.TRAJECTORY_ID_1
+    )
 
   @parameterized.named_parameters(
       ("with_slash", "traj/1001"),
@@ -355,31 +358,28 @@ class FileTrajectoryStoreTest(parameterized.TestCase):
       ]
       self.assertLen(meta_write_calls, 1)
 
-    self.assertTrue(meta_path.exists())
-    saved_meta = trajectory_lib.TrajectoryMetadata.model_validate_json(
-        meta_path.read_text()
+  def test_metadata_rewritten_when_metadata_changes(self) -> None:
+    """Verifies metadata.json is rewritten only when metadata content changes."""
+    meta_running = trajectory_testing.METADATA_2.model_copy(
+        update={"status": "RUNNING"}
     )
-    self.assertEqual(saved_meta, trajectory_testing.METADATA_1)
-
-  def test_metadata_updated_when_metadata_changes(self) -> None:
-    """Verifies metadata.json is updated when metadata content changes."""
-    meta_initial = trajectory_testing.METADATA_1
-    meta_completed = trajectory_testing.METADATA_1.model_copy(
-        update={"extra": {"status": "COMPLETED"}}
+    meta_completed = trajectory_testing.METADATA_2.model_copy(
+        update={"status": "COMPLETED"}
     )
-    meta_failed = trajectory_testing.METADATA_1.model_copy(
-        update={"extra": {"status": "FAILED"}}
+    meta_failed = trajectory_testing.METADATA_2.model_copy(
+        update={"status": "FAILED"}
     )
 
     path_cls = type(self.tmp_dir)
     meta_path = self.file_s.get_trajectory_metadata_path(
-        trajectory_testing.TRAJECTORY_ID_1
+        trajectory_testing.TRAJECTORY_ID_2
     )
+
     with mock.patch.object(
         path_cls, "write_text", autospec=True, side_effect=path_cls.write_text
     ) as mock_write:
-      # Step 1: Initial metadata written.
-      self.file_s.add_step(trajectory_testing.STEP_2_1, meta_initial)
+      # Step 1: Initial metadata -> written.
+      self.file_s.add_step(trajectory_testing.STEP_2_1, meta_running)
       self.file_s.flush()
       meta_write_calls = [
           c
@@ -388,8 +388,8 @@ class FileTrajectoryStoreTest(parameterized.TestCase):
       ]
       self.assertLen(meta_write_calls, 1)
 
-      # Step 2: Unchanged metadata skipped.
-      self.file_s.add_step(trajectory_testing.STEP_2_2, meta_initial)
+      # Step 2: Metadata unchanged -> skipped.
+      self.file_s.add_step(trajectory_testing.STEP_2_2, meta_running)
       self.file_s.flush()
       meta_write_calls = [
           c
@@ -462,6 +462,44 @@ class FileTrajectoryStoreTest(parameterized.TestCase):
       )
 
     self.assertTrue(step_path.exists())
+
+  def test_update_metadata(self) -> None:
+    meta = trajectory_lib.TrajectoryMetadata(
+        trajectory_id="t1",
+        agent=trajectory_lib.Agent(name="a1", version="1.0"),
+        extra={"status": "RUNNING"},
+    )
+    step = trajectory_lib.Step(
+        step_id=0, source=trajectory_lib.Source.AGENT, message="m1"
+    )
+    self.file_s.add_step(step, meta)
+    self.file_s.flush()
+    meta.extra["status"] = "SUCCEEDED"
+    self.file_s.update_metadata(meta)
+    self.file_s.flush()
+    read_meta = self.file_s.get_trajectories_metadata()[0]
+    self.assertEqual(read_meta.extra["status"], "SUCCEEDED")
+
+  def test_tunix_trajectory_with_step_zero(self) -> None:
+    meta = trajectory_lib.TunixTrajectoryMetadata(
+        trajectory_id="tunix_file_1",
+        agent=trajectory_lib.Agent(name="a1", version="1.0"),
+        status="RUNNING",
+    )
+    step0 = trajectory_lib.TunixStep(
+        step_id=0, source=trajectory_lib.Source.USER, message="prompt"
+    )
+    step1 = trajectory_lib.TunixStep(
+        step_id=1, source=trajectory_lib.Source.AGENT, message="response"
+    )
+    self.file_s.add_step(step0, meta)
+    self.file_s.add_step(step1, meta)
+    self.file_s.flush()
+    trajs = self.file_s.get_trajectories(["tunix_file_1"])
+    self.assertLen(trajs, 1)
+    self.assertIsInstance(trajs[0], trajectory_lib.TunixTrajectory)
+    self.assertEqual(trajs[0].steps[0].step_id, 0)
+    self.assertEqual(trajs[0].steps[1].step_id, 1)
 
 
 if __name__ == "__main__":

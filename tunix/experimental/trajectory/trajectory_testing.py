@@ -23,7 +23,7 @@ METADATA_1: Final[trajectory_lib.TrajectoryMetadata] = (
     )
 )
 STEP_1_1: Final[trajectory_lib.Step] = trajectory_lib.Step(
-    step_id=1,
+    step_id=0,
     source=trajectory_lib.Source.AGENT,
     message="Hello world",
     timestamp=TEST_TIMESTAMP,
@@ -33,7 +33,7 @@ TRAJECTORY_1: Final[trajectory_lib.Trajectory] = trajectory_lib.Trajectory(
     steps=[STEP_1_1],
 )
 
-# A single trajectory with two steps.
+# A single trajectory with five steps.
 TRAJECTORY_ID_2: Final[str] = "traj_1002"
 METADATA_2: Final[trajectory_lib.TrajectoryMetadata] = (
     trajectory_lib.TrajectoryMetadata(
@@ -42,31 +42,31 @@ METADATA_2: Final[trajectory_lib.TrajectoryMetadata] = (
     )
 )
 STEP_2_1: Final[trajectory_lib.Step] = trajectory_lib.Step(
-    step_id=1,
+    step_id=0,
     source=trajectory_lib.Source.USER,
     message="First step in traj 2",
     timestamp=TEST_TIMESTAMP,
 )
 STEP_2_2: Final[trajectory_lib.Step] = trajectory_lib.Step(
-    step_id=2,
+    step_id=1,
     source=trajectory_lib.Source.AGENT,
     message="Second step in traj 2",
     timestamp=TEST_TIMESTAMP,
 )
 STEP_2_3: Final[trajectory_lib.Step] = trajectory_lib.Step(
-    step_id=3,
+    step_id=2,
     source=trajectory_lib.Source.USER,
     message="Third step in traj 2",
     timestamp=TEST_TIMESTAMP,
 )
 STEP_2_4: Final[trajectory_lib.Step] = trajectory_lib.Step(
-    step_id=4,
+    step_id=3,
     source=trajectory_lib.Source.AGENT,
     message="Fourth step in traj 2",
     timestamp=TEST_TIMESTAMP,
 )
 STEP_2_5: Final[trajectory_lib.Step] = trajectory_lib.Step(
-    step_id=5,
+    step_id=4,
     source=trajectory_lib.Source.AGENT,
     message="Fifth step in traj 2",
     timestamp=TEST_TIMESTAMP,

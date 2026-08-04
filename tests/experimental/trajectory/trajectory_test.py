@@ -99,6 +99,23 @@ class StepTest(trajectory_testing.TrajectoryTestCase):
     restored_step = trajectory.TunixAgentStep(**step_dict)
     self.assertEqual(restored_step, step)
 
+  @parameterized.named_parameters(
+      ("policy_version", "policy_version", 1),
+      ("assistant_tokens", "assistant_tokens", [1, 2]),
+      ("assistant_masks", "assistant_masks", [1, 1]),
+      ("logprobs", "logprobs", [-0.1, -0.2]),
+  )
+  def test_validate_tunix_fields_rejects_non_agent(self, field_name, value):
+    # Invalid: non-agent step containing agent-only Tunix field
+    kwargs = {
+        "step_id": 0,
+        "source": trajectory.Source.USER,
+        "message": "User prompt",
+        field_name: value,
+    }
+    with self.assertRaises(ValueError):
+      trajectory.Step(**kwargs)
+
 
 class TrajectoryTest(trajectory_testing.TrajectoryTestCase):
   sample_atif_trajectory: trajectory.Trajectory
@@ -163,7 +180,7 @@ class TrajectoryTest(trajectory_testing.TrajectoryTestCase):
         "session_id": "test-session",
         "agent": {"name": "test-agent", "version": "1.0"},
         "steps": [{
-            "step_id": 1,
+            "step_id": 0,
             "source": "agent",
             "message": "Call tool",
             "tool_calls": [{
@@ -235,7 +252,7 @@ class TrajectoryTest(trajectory_testing.TrajectoryTestCase):
         metrics=metrics,
     )
 
-    self.assertEqual(step.step_id, 1)
+    self.assertEqual(step.step_id, 0)
     self.assertEqual(step.observation.results[0].content, "result")
     self.assertEqual(step.metrics.prompt_tokens, 20)
 
@@ -253,7 +270,7 @@ class TrajectoryTest(trajectory_testing.TrajectoryTestCase):
         extra={"key": "val"},
     )
     expected_data = {
-        "step_id": 1,
+        "step_id": 0,
         "source": "agent",
         "message": "Running...",
         "model_name": "gpt-4",
@@ -273,8 +290,8 @@ class TrajectoryTest(trajectory_testing.TrajectoryTestCase):
     data = {
         "agent": {"name": "test-agent", "version": "1.0"},
         "steps": [
-            {"step_id": 1, "source": "user", "message": "First"},
-            {"step_id": 3, "source": "agent", "message": "Third"},
+            {"step_id": 0, "source": "user", "message": "First"},
+            {"step_id": 2, "source": "agent", "message": "Third"},
         ],
     }
     with self.assertRaises(ValueError):
@@ -285,22 +302,38 @@ class TrajectoryTest(trajectory_testing.TrajectoryTestCase):
     data = {
         "agent": {"name": "test-agent", "version": "1.0"},
         "steps": [
-            {"step_id": 2, "source": "agent", "message": "Second"},
-            {"step_id": 1, "source": "user", "message": "First"},
+            {"step_id": 1, "source": "agent", "message": "Second"},
+            {"step_id": 0, "source": "user", "message": "First"},
         ],
     }
     traj = trajectory.Trajectory.from_json_dict(data)
-    self.assertEqual(traj.steps[0].step_id, 1)
-    self.assertEqual(traj.steps[1].step_id, 2)
+    self.assertEqual(traj.steps[0].step_id, 0)
+    self.assertEqual(traj.steps[1].step_id, 1)
+
+  def test_validate_step_ids_does_not_mutate_caller_list(self):
+    step0 = trajectory.Step(
+        step_id=0, source=trajectory.Source.USER, message="s0"
+    )
+    step1 = trajectory.Step(
+        step_id=1, source=trajectory.Source.AGENT, message="s1"
+    )
+    caller_list = [step1, step0]
+    _ = trajectory.Trajectory(
+        agent=trajectory.Agent(name="a", version="1.0"),
+        steps=caller_list,
+    )
+    # Caller list should remain in original order [step1, step0]
+    self.assertIs(caller_list[0], step1)
+    self.assertIs(caller_list[1], step0)
 
   def test_validate_embedded_subagent_missing_trajectory_id(self):
     # Invalid: missing trajectory_id on embedded subagent
     data = {
         "agent": {"name": "test-agent", "version": "1.0"},
-        "steps": [{"step_id": 1, "source": "user", "message": "First"}],
+        "steps": [{"step_id": 0, "source": "user", "message": "First"}],
         "subagent_trajectories": [{
             "agent": {"name": "sub-agent", "version": "1.0"},
-            "steps": [{"step_id": 1, "source": "agent", "message": "Sub"}],
+            "steps": [{"step_id": 0, "source": "agent", "message": "Sub"}],
         }],
     }
     with self.assertRaises(ValueError):
@@ -310,20 +343,20 @@ class TrajectoryTest(trajectory_testing.TrajectoryTestCase):
     # Invalid: duplicate trajectory_id on embedded subagents
     data = {
         "agent": {"name": "test-agent", "version": "1.0"},
-        "steps": [{"step_id": 1, "source": "user", "message": "First"}],
+        "steps": [{"step_id": 0, "source": "user", "message": "First"}],
         "subagent_trajectories": [
             {
                 "trajectory_id": "dup-id",
                 "agent": {"name": "sub-1", "version": "1.0"},
                 "steps": [
-                    {"step_id": 1, "source": "agent", "message": "Sub 1"}
+                    {"step_id": 0, "source": "agent", "message": "Sub 1"}
                 ],
             },
             {
                 "trajectory_id": "dup-id",
                 "agent": {"name": "sub-2", "version": "1.0"},
                 "steps": [
-                    {"step_id": 1, "source": "agent", "message": "Sub 2"}
+                    {"step_id": 0, "source": "agent", "message": "Sub 2"}
                 ],
             },
         ],
@@ -335,20 +368,20 @@ class TrajectoryTest(trajectory_testing.TrajectoryTestCase):
     # Valid: unique trajectory_id on embedded subagents
     data = {
         "agent": {"name": "test-agent", "version": "1.0"},
-        "steps": [{"step_id": 1, "source": "user", "message": "First"}],
+        "steps": [{"step_id": 0, "source": "user", "message": "First"}],
         "subagent_trajectories": [
             {
                 "trajectory_id": "sub-1",
                 "agent": {"name": "sub-1", "version": "1.0"},
                 "steps": [
-                    {"step_id": 1, "source": "agent", "message": "Sub 1"}
+                    {"step_id": 0, "source": "agent", "message": "Sub 1"}
                 ],
             },
             {
                 "trajectory_id": "sub-2",
                 "agent": {"name": "sub-2", "version": "1.0"},
                 "steps": [
-                    {"step_id": 1, "source": "agent", "message": "Sub 2"}
+                    {"step_id": 0, "source": "agent", "message": "Sub 2"}
                 ],
             },
         ],

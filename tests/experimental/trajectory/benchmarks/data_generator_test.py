@@ -54,7 +54,8 @@ class DataGeneratorTest(absltest.TestCase):
     )
     for _, steps in data_generator.generate_trajectories(workload):
       self.assertLen(steps, 3)
-      for step in steps:
+      for idx, step in enumerate(steps):
+        self.assertEqual(step.step_id, idx)
         self.assertLen(step.message, 50)
 
 

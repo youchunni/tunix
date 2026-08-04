@@ -14,7 +14,6 @@
 
 """Converter for translating between Tunix RL Step and Trajectory Step representations."""
 
-import typing
 from typing import Any
 
 import numpy as np
@@ -73,14 +72,14 @@ def _extract_observation(obs_val: Any) -> trajectory_lib.Observation | None:
 
 def create_task_step(
     task: Any,
-) -> trajectory_lib.TunixEnvStep | None:
+) -> trajectory_lib.Step | None:
   """Creates an initial user task Step from a task prompt or object.
 
   Args:
     task: The task prompt string, dictionary with 'prompts', or None.
 
   Returns:
-    A Tunix Step with step_id=0 and source=USER containing the task prompt,
+    A Step with step_id=0 and source=USER containing the task prompt,
     or None if task is None or empty.
   """
   if task is None:
@@ -99,7 +98,7 @@ def create_task_step(
   if not prompt_str:
     return None
 
-  return trajectory_lib.TunixEnvStep(
+  return trajectory_lib.Step(
       step_id=0,
       source=trajectory_lib.Source.USER,
       message=prompt_str,
@@ -109,7 +108,8 @@ def create_task_step(
 def create_agent_step(
     step: agent_types.Step | None,
     tunix_step_id: int,
-) -> trajectory_lib.TunixAgentStep | None:
+    policy_version: int | None = None,
+) -> trajectory_lib.Step | None:
   """Converts a Tunix agent_types.Step into an agent turn Step.
 
   Maps the 0-based Tunix interaction turn index (`tunix_step_id`) to the
@@ -119,6 +119,7 @@ def create_agent_step(
   Args:
     step: The Tunix RL step to convert, or None.
     tunix_step_id: 0-based turn index of the step in the Tunix trajectory.
+    policy_version: Optional policy version override for the agent step.
 
   Returns:
     The converted Step (with step_id = 2 * tunix_step_id + 1), or None if step
@@ -140,8 +141,16 @@ def create_agent_step(
     if raw_action is not None:
       extra["raw_action"] = raw_action
 
+  effective_policy_version = (
+      policy_version
+      if policy_version is not None
+      else getattr(step, "policy_version", None)
+  )
+  if effective_policy_version is None and "policy_version" in extra:
+    effective_policy_version = extra["policy_version"]
+
   converted_step_id = 2 * tunix_step_id + 1
-  return trajectory_lib.TunixAgentStep(
+  return trajectory_lib.Step(
       step_id=converted_step_id,
       source=trajectory_lib.Source.AGENT,
       message=step.model_response,
@@ -151,7 +160,10 @@ def create_agent_step(
       assistant_tokens=step.assistant_tokens,
       assistant_masks=step.assistant_masks,
       logprobs=step.logprobs,
-      mc_return=step.mc_return or None,
+      policy_version=effective_policy_version,
+      mc_return=(
+          float(step.mc_return) if step.mc_return is not None else None
+      ),
       extra=extra or None,
   )
 
@@ -159,7 +171,7 @@ def create_agent_step(
 def create_env_step(
     step: agent_types.Step | None,
     tunix_step_id: int,
-) -> trajectory_lib.TunixEnvStep | None:
+) -> trajectory_lib.Step | None:
   """Converts a Tunix agent_types.Step into an environment turn Step.
 
   Maps the 0-based Tunix interaction turn index (`tunix_step_id`) to the
@@ -179,7 +191,7 @@ def create_env_step(
 
   obs_str = str(step.observation) if step.observation is not None else ""
   converted_step_id = 2 * tunix_step_id + 2
-  return trajectory_lib.TunixEnvStep(
+  return trajectory_lib.Step(
       step_id=converted_step_id,
       source=trajectory_lib.Source.SYSTEM,
       message=obs_str,
@@ -205,8 +217,8 @@ def _to_numpy_or_none(arr: Any) -> np.ndarray | None:
 
 
 def to_tunix_step(
-    agent_step: trajectory_lib.TunixAgentStep | None = None,
-    env_step: trajectory_lib.TunixEnvStep | None = None,
+    agent_step: trajectory_lib.Step | None = None,
+    env_step: trajectory_lib.Step | None = None,
 ) -> agent_types.Step:
   """Converts Trajectory agent and/or env steps into a single Tunix Step.
 
@@ -309,7 +321,7 @@ def to_tunix_step(
 
 
 def to_tunix_trajectory(
-    traj: trajectory_lib.TunixTrajectory | dict[str, Any],
+    traj: trajectory_lib.Trajectory | dict[str, Any],
 ) -> agent_types.Trajectory:
   """Converts a Trajectory into a Tunix agent_types.Trajectory.
 
@@ -325,7 +337,7 @@ def to_tunix_trajectory(
     A reconstructed Tunix agent_types.Trajectory instance.
   """
   if isinstance(traj, dict):
-    traj_obj = trajectory_lib.TunixTrajectory.from_json_dict(traj)
+    traj_obj = trajectory_lib.Trajectory.from_json_dict(traj)
   else:
     traj_obj = traj
 
@@ -346,22 +358,17 @@ def to_tunix_trajectory(
   while converted_step_idx < num_converted_steps:
     curr_step = traj_obj.steps[converted_step_idx]
     if curr_step.source == trajectory_lib.Source.AGENT:
-      curr_step = typing.cast(trajectory_lib.TunixAgentStep, curr_step)
-      next_step: trajectory_lib.TunixEnvStep | None = None
+      next_step: trajectory_lib.Step | None = None
       if (
           converted_step_idx + 1 < num_converted_steps
           and traj_obj.steps[converted_step_idx + 1].source
           != trajectory_lib.Source.AGENT
       ):
-        next_step = typing.cast(
-            trajectory_lib.TunixEnvStep,
-            traj_obj.steps[converted_step_idx + 1],
-        )
+        next_step = traj_obj.steps[converted_step_idx + 1]
       dto_step = to_tunix_step(agent_step=curr_step, env_step=next_step)
       dto_steps.append(dto_step)
       converted_step_idx += 2 if next_step is not None else 1
     else:
-      curr_step = typing.cast(trajectory_lib.TunixEnvStep, curr_step)
       dto_step = to_tunix_step(agent_step=None, env_step=curr_step)
       dto_steps.append(dto_step)
       converted_step_idx += 1
@@ -394,10 +401,12 @@ def create_trajectory_metadata(
     request: Any = None,
     agent: Any = None,
     target_policy_versions: list[int] | None = None,
-    status: str = "RUNNING",
+    status: (
+        str | agent_types.TrajectoryStatus
+    ) = agent_types.TrajectoryStatus.RUNNING,
     extra: dict[str, Any] | None = None,
-) -> trajectory_lib.TunixTrajectoryMetadata:
-  """Constructs TunixTrajectoryMetadata from rollout request and agent state."""
+) -> trajectory_lib.TrajectoryMetadata:
+  """Constructs TrajectoryMetadata from rollout request and agent state."""
   meta_extra = dict(getattr(request, "metadata", None) or {})
   if extra:
     meta_extra.update(extra)
@@ -411,16 +420,118 @@ def create_trajectory_metadata(
     )
   traj_obj = getattr(agent, "trajectory", None)
 
-  return trajectory_lib.TunixTrajectoryMetadata(
+  effective_status = status
+  if effective_status is None:
+    effective_status = getattr(
+        traj_obj, "status", agent_types.TrajectoryStatus.RUNNING
+    )
+
+  status_str = (
+      effective_status.name
+      if hasattr(effective_status, "name")
+      else str(effective_status)
+  )
+
+  return trajectory_lib.TrajectoryMetadata(
       trajectory_id=traj_id,
       agent=agent_obj,
       prompt_id=getattr(request, "prompt_id", None),
       group_offset_id=getattr(request, "group_offset_id", None),
       target_policy_versions=target_policy_versions,
-      status=status,
+      status=status_str,
       total_reward=getattr(traj_obj, "reward", None),
       hyperparams=getattr(request, "generation_kwargs", None),
       env_time=getattr(traj_obj, "env_time", None),
       reward_time=getattr(traj_obj, "reward_time", None),
       extra=meta_extra or None,
   )
+
+
+def update_trajectory_metadata(
+    metadata: trajectory_lib.TrajectoryMetadata,
+    agent: Any = None,
+    policy_version: int | None = None,
+    target_policy_versions: list[int] | None = None,
+    status: str | agent_types.TrajectoryStatus | None = None,
+    env_time: dict[str, Any] | None = None,
+    reward_time: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> trajectory_lib.TrajectoryMetadata:
+  """Updates an existing TrajectoryMetadata with latest agent/trajectory state.
+
+  Args:
+    metadata: The TrajectoryMetadata instance to update in place.
+    agent: Optional agent containing trajectory status, reward, and timings.
+    policy_version: Optional policy version to append to target_policy_versions.
+    target_policy_versions: Optional explicit list of target policy versions.
+    status: Optional explicit status override.
+    env_time: Optional explicit environment timing dictionary.
+    reward_time: Optional explicit reward timing dictionary.
+    extra: Optional dictionary of extra metadata fields to merge.
+
+  Returns:
+    The updated TrajectoryMetadata instance.
+  """
+  traj_obj = getattr(agent, "trajectory", None)
+  if status is not None:
+    status_str = status.name if hasattr(status, "name") else str(status)
+  elif traj_obj is not None and getattr(traj_obj, "status", None) is not None:
+    traj_status = traj_obj.status
+    status_str = (
+        traj_status.name if hasattr(traj_status, "name") else str(traj_status)
+    )
+  else:
+    status_str = None
+
+  if status_str is not None:
+    if hasattr(metadata, "status"):
+      setattr(metadata, "status", status_str)
+    elif metadata.extra is not None:
+      metadata.extra["status"] = status_str
+
+  if target_policy_versions is not None:
+    if hasattr(metadata, "target_policy_versions"):
+      setattr(metadata, "target_policy_versions", list(target_policy_versions))
+    elif metadata.extra is not None:
+      metadata.extra["target_policy_versions"] = list(target_policy_versions)
+  elif policy_version is not None:
+    if hasattr(metadata, "target_policy_versions"):
+      current_versions = getattr(metadata, "target_policy_versions", None)
+      if current_versions is None:
+        setattr(metadata, "target_policy_versions", [policy_version])
+      elif policy_version not in current_versions:
+        current_versions.append(policy_version)
+    elif metadata.extra is not None:
+      existing = metadata.extra.setdefault("target_policy_versions", [])
+      if policy_version not in existing:
+        existing.append(policy_version)
+
+  if traj_obj is not None:
+    if hasattr(metadata, "total_reward"):
+      setattr(metadata, "total_reward", getattr(traj_obj, "reward", None))
+    effective_env_time = (
+        env_time
+        if env_time is not None
+        else getattr(traj_obj, "env_time", None)
+    )
+    if hasattr(metadata, "env_time") and effective_env_time is not None:
+      setattr(metadata, "env_time", effective_env_time)
+    effective_reward_time = (
+        reward_time
+        if reward_time is not None
+        else getattr(traj_obj, "reward_time", None)
+    )
+    if hasattr(metadata, "reward_time") and effective_reward_time is not None:
+      setattr(metadata, "reward_time", effective_reward_time)
+  else:
+    if hasattr(metadata, "env_time") and env_time is not None:
+      setattr(metadata, "env_time", env_time)
+    if hasattr(metadata, "reward_time") and reward_time is not None:
+      setattr(metadata, "reward_time", reward_time)
+
+  if extra:
+    if metadata.extra is None:
+      metadata.extra = {}
+    metadata.extra.update(extra)
+
+  return metadata

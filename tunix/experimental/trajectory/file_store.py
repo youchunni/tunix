@@ -1,9 +1,10 @@
 """File-based implementation for Trajectory Store."""
 
 import functools
+import json
 import re
 import types
-from typing import Final
+from typing import Any, Final
 
 from etils import epath
 from tunix.experimental.trajectory import async_writer
@@ -50,6 +51,14 @@ def _validate_trajectory_id(trajectory_id: str | None) -> str:
   return trajectory_id
 
 
+def _load_metadata(
+    meta_json: str,
+) -> trajectory_lib.TrajectoryMetadata:
+  """Loads trajectory metadata JSON into TrajectoryMetadata."""
+  data = json.loads(meta_json)
+  return trajectory_lib.TrajectoryMetadata.model_validate(data)
+
+
 class FileTrajectoryStore(store.TrajectoryReader, store.TrajectoryWriter):
   """File-based implementation satisfying TrajectoryReader and TrajectoryWriter.
 
@@ -69,23 +78,21 @@ class FileTrajectoryStore(store.TrajectoryReader, store.TrajectoryWriter):
     <root_dir>/[<run_id>/]/
         └── traj_<trajectory_id>/
             ├── metadata.json
+            ├── step_000000.json
             ├── step_000001.json
-            ├── step_000002.json
             └── ...
   """
 
   def __init__(
-      self, root_dir: epath.PathLike, run_id: str | None = None
+      self,
+      root_dir: str | epath.Path,
+      run_id: str | None = None,
   ) -> None:
-    """Initializes FileTrajectoryStore.
+    """Initializes the FileTrajectoryStore.
 
     Args:
-      root_dir: Base directory path for storage (supports local paths and GCS
-        uris e.g., 'gs://bucket/path').
-      run_id: Optional unique identifier for the RL run. If provided, paths are
-        scoped under root_dir / run_id. This ID MUST stay the same when
-        recovering from failures or process restarts as long as the same RL
-        process is being continued.
+      root_dir: Base directory for storing trajectory runs.
+      run_id: Optional subdirectory name grouping trajectories from a run.
     """
     self._raw_root_dir = epath.Path(root_dir)
     self._run_id = run_id
@@ -130,11 +137,10 @@ class FileTrajectoryStore(store.TrajectoryReader, store.TrajectoryWriter):
       traj_id = match.group("trajectory_id")
       meta_path = self.get_trajectory_metadata_path(traj_id)
       if not meta_path.exists():
-        raise store.TrajectoryMetadataNotFoundError(entry.name)
+        raise store.TrajectoryMetadataNotFoundError(traj_id)
 
-      meta = trajectory_lib.TrajectoryMetadata.model_validate_json(
-          meta_path.read_text()
-      )
+      meta_json = meta_path.read_text(encoding="utf-8")
+      meta = _load_metadata(meta_json)
       metas.append(meta)
 
     return metas
@@ -162,20 +168,18 @@ class FileTrajectoryStore(store.TrajectoryReader, store.TrajectoryWriter):
       if not meta_path.exists():
         raise store.TrajectoryNotFoundError(traj_id)
 
-      meta = trajectory_lib.TrajectoryMetadata.model_validate_json(
-          meta_path.read_text()
-      )
-      steps: list[trajectory_lib.Step] = []
+      meta_json = meta_path.read_text(encoding="utf-8")
+      meta_dict = json.loads(meta_json)
 
-      for file_entry in traj_dir.iterdir():
+      raw_steps: list[dict[str, Any]] = []
+      for file_entry in sorted(traj_dir.iterdir()):
         if not _STEP_FILENAME_REGEX.match(file_entry.name):
           continue
-        step = trajectory_lib.Step.model_validate_json(file_entry.read_text())
-        steps.append(step)
+        step_dict = json.loads(file_entry.read_text(encoding="utf-8"))
+        raw_steps.append(step_dict)
 
-      traj_data = meta.model_dump()
-      traj_data["steps"] = steps
-      trajs.append(trajectory_lib.Trajectory(**traj_data))
+      steps = [trajectory_lib.Step.model_validate(sd) for sd in raw_steps]
+      trajs.append(trajectory_lib.Trajectory(**meta_dict, steps=steps))
 
     return trajs
 
