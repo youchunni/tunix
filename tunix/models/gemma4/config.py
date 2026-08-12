@@ -14,6 +14,7 @@
 
 """Gemma4 model configuration."""
 
+import bisect
 import dataclasses
 import enum
 from typing import Any, Tuple
@@ -69,6 +70,51 @@ class RematConfig(enum.Enum):
   NONE = enum.auto()
   BLOCK = enum.auto()
   DECODER = enum.auto()
+
+
+# Prefix-length bucketing prevents recompilation storms: each unique
+# prefix_length baked via partial triggers a separate XLA compilation, so we
+# round up to a fixed ladder of boundaries to bound the number of compiles.
+# Use pow2_buckets() / linear_buckets() to build common ladders.
+def pow2_buckets(max_len: int = 131072) -> tuple[int, ...]:
+  """Powers-of-two ladder: (0, 128, 256, ..., max_len). Default."""
+  buckets = [0]
+  n = 128
+  while n <= max_len:
+    buckets.append(n)
+    n *= 2
+  return tuple(buckets)
+
+
+def linear_buckets(step: int = 512, max_len: int = 131072) -> tuple[int, ...]:
+  """Linear ladder: (0, step, 2*step, ..., max_len). The 'x*512' case."""
+  return tuple(range(0, max_len + 1, step))
+
+
+def _bucket_prefix_length(
+    prefix_length: int, cache_len: int, boundaries: tuple[int, ...]
+) -> int:
+  """Round prefix_length up to the nearest bucket for compilation stability.
+
+  Positions beyond the actual prefix_length are zeroed via dynamic masking,
+  so the padding is semantically invisible to the model.
+  """
+  i = bisect.bisect_left(boundaries, prefix_length)
+  bucket = boundaries[i] if i < len(boundaries) else cache_len
+  return min(bucket, cache_len)
+
+
+def _maybe_bucket_prefix_length(
+    prefix_length: int,
+    cache: LayerCache | None,
+    is_chunked_prefill: bool,
+    boundaries: tuple[int, ...],
+) -> int:
+  """Buckets prefix_length during chunked prefill; passthrough otherwise."""
+  if not is_chunked_prefill or prefix_length <= 0 or not boundaries:
+    return prefix_length
+  cache_len = cache['v'].shape[1] if cache is not None else prefix_length
+  return _bucket_prefix_length(prefix_length, cache_len, boundaries)
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -178,6 +224,13 @@ class ModelConfig:
   # everything (minimum HBM).
   remat_policy: str = 'nothing_saveable'
 
+  # Prefix-length bucket ladder for chunked prefill. Each distinct bucketed
+  # prefix_length is baked as a static partial arg, so it is a separate XLA
+  # compilation; this ladder bounds the number of compiles. An empty tuple
+  # disables bucketing (passthrough, accepts recompiles). Use pow2_buckets() /
+  # linear_buckets() to build common ladders. Must be sorted and non-negative.
+  prefix_bucket_boundaries: tuple[int, ...] = linear_buckets(step=512)
+
   # When True, the splash attention backward pass uses a single fused kernel
   # for dQ+dKV instead of two separate passes, reducing VMEM round-trips.
   # When enabled, block_q_dq and block_kv_dq are ignored (set to None).
@@ -198,10 +251,13 @@ class ModelConfig:
   audio_encoder: audio.ConformerConfig | None = None
 
   def __post_init__(self):
-    # TODO(tunix-dev): support flash attention with sliding window KV cache
-    if self.use_sliding_window_kv_cache and self.use_flash_attention:
+    boundaries = self.prefix_bucket_boundaries
+    if any(b < 0 for b in boundaries) or boundaries != tuple(
+        sorted(set(boundaries))
+    ):
       raise ValueError(
-          'Flash attention and sliding window KV cache are mutually exclusive.'
+          'prefix_bucket_boundaries must be non-negative and sorted strictly '
+          f'ascending with no duplicates; got {boundaries}'
       )
 
   @classmethod
