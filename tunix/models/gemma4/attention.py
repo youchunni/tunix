@@ -27,6 +27,7 @@ import jax.sharding as shd
 from jax.sharding import PartitionSpec as P
 import jaxtyping
 import numpy as np
+from tunix.models.gemma4.config import _maybe_bucket_prefix_length
 from tunix.models.gemma4.config import AttentionType
 from tunix.models.gemma4.config import K_MASK
 from tunix.models.gemma4.config import LayerCache
@@ -50,10 +51,10 @@ def find_last_one_index(attn_mask: jnp.ndarray) -> jnp.ndarray:
   # 2. reverse the rows in the attn_mask
   reversed_matrix = attn_mask[:, :, ::-1]
 
-  # 3. find the fist 1 from the right.
+  # 3. find the first 1 from the right.
   first_one_from_right = jnp.argmax(reversed_matrix, axis=-1)
 
-  # 4. covert back to the original index
+  # 4. convert back to the original index
   last_one_index_original = cache_len - 1 - first_one_from_right
 
   # 5. return the final index, 0 for rows are all zeros.
@@ -106,6 +107,75 @@ def _get_causal_mask(
 ) -> mask_lib.CausalMask:
   """Memoized CausalMask constructor that speeds up XLA JIT compilation by caching mask closure objects across unrolled decoder layers."""
   return mask_lib.CausalMask((q_len, kv_len), offset=offset)
+
+
+def create_logical_sliding_window_mask(
+    attn_mask: jnp.ndarray,  # [B, 1, cache_len] (decoding: seq_len == 1)
+    sliding_window_size: int,
+) -> jnp.ndarray:
+  """Sliding-window mask over LOGICAL token positions (for chunked decode).
+
+  Physical-slot windowing (``create_sliding_window_mask``) assumes a contiguous
+  KV buffer layout. When warm-prefix chunked prefill leaves a physical padding
+  gap between prompt KV and suffix tokens, physical distance no longer matches
+  logical sequence distance, causing valid prompt tokens to be masked out
+  prematurely. This variant assigns each valid slot a contiguous logical
+  position
+  (cumsum of the validity mask) so the window follows the real tokens across the
+  gap, and reduces exactly to the physical version when the valid region is
+  contiguous.
+  """
+  valid = attn_mask != 0
+  valid_i = valid.astype(jnp.int32)
+  # Contiguous logical position of each valid slot; invalid slots are dropped by
+  # the `& valid` below, so their (meaningless) values do not matter.
+  logical_pos = jnp.cumsum(valid_i, axis=-1) - 1  # [B, 1, cache_len]
+  logical_last = jnp.sum(valid_i, axis=-1, keepdims=True) - 1  # [B, 1, 1]
+  window_mask = logical_pos > (logical_last - sliding_window_size)
+  final_mask = window_mask & valid
+  return final_mask  # [B, 1, cache_len]
+
+
+def _has_physical_gap(attn_mask: jnp.ndarray) -> jnp.ndarray:
+  """Per-row flag: is the valid region non-contiguous (a chunked-prefill gap)?
+
+  Returns a ``[B, 1, 1]`` boolean. Standard left-pad decode has a contiguous
+  valid region (count == span) so this is False everywhere, and the caller's
+  ``jnp.where`` selects the original physical window unchanged -> byte-identical
+  normal-decode behavior. Only genuinely gapped rows switch to the logical mask.
+  """
+  valid = attn_mask != 0  # [B, 1, cache_len]
+  n = attn_mask.shape[-1]
+  idx = jnp.arange(n)  # [cache_len]
+  count = jnp.sum(valid.astype(jnp.int32), axis=-1, keepdims=True)  # [B,1,1]
+  first = jnp.min(jnp.where(valid, idx, n), axis=-1, keepdims=True)  # [B,1,1]
+  last = jnp.max(jnp.where(valid, idx, -1), axis=-1, keepdims=True)  # [B,1,1]
+  span = last - first + 1
+  return count < span  # [B, 1, 1]
+
+
+def _merge_split_attention(
+    out_prefix, lse_prefix, out_suffix, lse_suffix, out_dtype
+):
+  """LSE-weighted merge of two attention partitions. Pure JAX; CPU-testable.
+
+  nan_to_num zeroes fully-masked (out=NaN / lse=-inf) partitions so they don't
+  poison the residual stream. Boundary-straddling garbage rows are instead
+  neutralized by weight underflow, which relies on splash's DEFAULT_MASK_VALUE
+  staying large-negative.
+  """
+  # lse shape: (B, N, T), out shape: (B, N, T, H)
+  max_lse = jnp.maximum(lse_prefix, lse_suffix)
+  # Guard against (-inf) - (-inf) = NaN when both partitions are fully masked.
+  w_prefix = jnp.nan_to_num(jnp.exp(lse_prefix - max_lse), nan=0.0)
+  w_suffix = jnp.nan_to_num(jnp.exp(lse_suffix - max_lse), nan=0.0)
+  w_sum = w_prefix + w_suffix
+  w_sum_safe = jnp.where(w_sum > 0, w_sum, 1.0)
+  encoded = (
+      w_prefix[..., None] * jnp.nan_to_num(out_prefix.astype(jnp.float32))
+      + w_suffix[..., None] * jnp.nan_to_num(out_suffix.astype(jnp.float32))
+  ) / w_sum_safe[..., None]
+  return encoded.astype(out_dtype)
 
 
 class Attention(nnx.Module):
@@ -247,6 +317,356 @@ class Attention(nnx.Module):
 
     return key_proj, value_proj, kv_valid_mask
 
+  def _update_cache_prefill(
+      self,
+      cache: LayerCache,
+      key_proj: jaxtyping.Array,
+      value_proj: jaxtyping.Array,
+      seq_len: int,
+      *,
+      is_chunked_prefill: bool,
+      prefix_length: int,
+      input_mask: jaxtyping.Array | None,
+  ) -> tuple[
+      LayerCache,
+      jaxtyping.Array,
+      jaxtyping.Array,
+      jaxtyping.Array | None,
+      jaxtyping.Array,
+      jaxtyping.Array | None,
+      jaxtyping.Array | None,
+  ]:
+    """Updates KV cache and prepares KV for attention during prefill.
+
+    Delegates to _write_cache_prefill and _read_prefix_kv; these have no data
+    dependency, so XLA can overlap the cache write with attention.
+    """
+    prior_end_index = cache['end_index'][0]
+
+    # Write fresh KV to cache (independent of prefix read).
+    new_cache = self._write_cache_prefill(
+        cache,
+        key_proj,
+        value_proj,
+        seq_len,
+        is_chunked_prefill=is_chunked_prefill,
+        input_mask=input_mask,
+    )
+
+    # Read prefix KV from ORIGINAL cache (not new_cache: we want the pre-write
+    # state). When use_split_attention is True, returns prefix/suffix separately
+    # to avoid materializing the concatenated KV tensor in HBM.
+    key_proj, value_proj, kv_valid_mask, prefix_k, prefix_v = (
+        self._read_prefix_kv(
+            cache,
+            key_proj,
+            value_proj,
+            seq_len,
+            is_chunked_prefill=is_chunked_prefill,
+            prefix_length=prefix_length,
+            prior_end_index=prior_end_index,
+        )
+    )
+
+    return (
+        new_cache,
+        key_proj,
+        value_proj,
+        kv_valid_mask,
+        prior_end_index,
+        prefix_k,
+        prefix_v,
+    )
+
+  def _write_cache_prefill(
+      self,
+      cache: LayerCache,
+      key_proj: jaxtyping.Array,
+      value_proj: jaxtyping.Array,
+      seq_len: int,
+      *,
+      is_chunked_prefill: bool,
+      input_mask: jaxtyping.Array | None,
+  ) -> LayerCache:
+    """Writes fresh KV projections to cache. Returns updated cache.
+
+    Separated from prefix read so XLA can overlap cache writes with attention.
+    """
+    cache_len = cache['v'].shape[1]
+    prior_end_index = cache['end_index'][0]
+
+    if self.config.use_sliding_window_kv_cache:
+      if is_chunked_prefill and input_mask is not None:
+        b = key_proj.shape[0]
+        prior = cache['end_index']
+        n_r = jnp.sum(input_mask.astype(jnp.int32), axis=-1)
+        i = jnp.arange(cache_len)
+        cpos = (n_r[:, None] - cache_len) + i[None, :]
+        valid = (cpos >= 0) & (cpos < n_r[:, None])
+        safe_cpos = jnp.clip(cpos, 0, seq_len - 1)
+        slot = (prior[:, None] + cpos) % cache_len
+        b_idx = jnp.arange(b)[:, None]
+        new_k = key_proj[b_idx, safe_cpos]
+        new_v = value_proj[b_idx, safe_cpos]
+        old_k = cache['k'][b_idx, slot]
+        old_v = cache['v'][b_idx, slot]
+        valid_4d = valid[:, :, None, None]
+        cache_k = (
+            cache['k'].at[b_idx, slot].set(jnp.where(valid_4d, new_k, old_k))
+        )
+        cache_v = (
+            cache['v'].at[b_idx, slot].set(jnp.where(valid_4d, new_v, old_v))
+        )
+      else:
+        end_index = prior_end_index
+        valid_len = min(seq_len, cache_len)
+        latest_indices = (
+            end_index + (seq_len - valid_len) + jnp.arange(valid_len)
+        ) % cache_len
+        new_v = value_proj[:, -valid_len:, ...]
+        new_k = key_proj[:, -valid_len:, ...]
+        cache_v = cache['v'].at[:, latest_indices, ...].set(new_v)
+        cache_k = cache['k'].at[:, latest_indices, ...].set(new_k)
+    else:
+      end_index = prior_end_index
+      slice_indices = (0, end_index % cache_len, 0, 0)
+      cache_v = jax.lax.dynamic_update_slice(
+          cache['v'], value_proj, slice_indices
+      )
+      cache_k = jax.lax.dynamic_update_slice(
+          cache['k'], key_proj, slice_indices
+      )
+
+    # Non-uniform (ragged) input masks are safe: PAD-position KVs are zeroed in
+    # _compute_kv_projections and excluded by the attention mask.
+
+    return {
+        'v': cache_v,
+        'k': cache_k,
+        'end_index': (
+            cache['end_index']
+            + (
+                # PAD-safe: advance by the batch-max real-token count
+                # (elements may be ragged under PAD); PAD KVs are zeroed and
+                # attention-masked, so reserving up to the max is safe.
+                jnp.max(jnp.sum(input_mask, axis=-1)).astype(jnp.int32)
+                if is_chunked_prefill and input_mask is not None
+                else seq_len
+            )
+        ),
+    }
+
+  def _read_prefix_kv(
+      self,
+      cache: LayerCache,
+      key_proj: jaxtyping.Array,
+      value_proj: jaxtyping.Array,
+      seq_len: int,
+      *,
+      is_chunked_prefill: bool,
+      prefix_length: int,
+      prior_end_index: jaxtyping.Array,
+  ) -> tuple[
+      jaxtyping.Array,
+      jaxtyping.Array,
+      jaxtyping.Array | None,
+      jaxtyping.Array | None,
+      jaxtyping.Array | None,
+  ]:
+    """Reads prefix KV from cache.
+
+    When use_split_attention is True, returns prefix and suffix KV separately
+    (no concatenation). Otherwise, concatenates prefix with fresh KV.
+
+    Separated from cache write so the read is independent of the write and can
+    be overlapped with attention by XLA.
+    """
+    kv_valid_mask = None
+    cache_len = cache['v'].shape[1]
+
+    if not (is_chunked_prefill and prefix_length > 0):
+      return key_proj, value_proj, kv_valid_mask, None, None
+
+    # Clamp prefix_length to cache_len so mask and KV slice stay consistent:
+    # JAX slicing silently clamps, but the mask would use the unclamped value,
+    # creating a shape mismatch.
+    prefix_length = min(prefix_length, cache_len)
+
+    if (
+        self.config.use_sliding_window_kv_cache
+        and self.attn_type == AttentionType.LOCAL_SLIDING
+    ):
+      # LOCAL: Unroll ring buffer to get chronologically-ordered prefix KV
+      valid_cached = jnp.minimum(prior_end_index, cache_len)
+      read_start = (prior_end_index - valid_cached) % cache_len
+      i = jnp.arange(cache_len)
+      kv_valid_mask = i < valid_cached
+      physical_indices = (read_start + i) % cache_len
+      cached_k = cache['k'][:, physical_indices, ...]
+      cached_v = cache['v'][:, physical_indices, ...]
+      cached_k = jnp.where(kv_valid_mask[None, :, None, None], cached_k, 0)
+      cached_v = jnp.where(kv_valid_mask[None, :, None, None], cached_v, 0)
+    else:
+      # GLOBAL: Static slice for prefix KV. Use bucketed prefix_length for
+      # compilation stability; mask out padding positions dynamically.
+      cached_k = cache['k'][:, :prefix_length, ...]
+      cached_v = cache['v'][:, :prefix_length, ...]
+      # Zero out positions beyond the actual valid prefix. The bucketed
+      # prefix_length may exceed prior_end_index; those positions contain
+      # uninitialized cache data that must not influence attention.
+      valid_prefix = jnp.arange(prefix_length) < prior_end_index
+      cached_k = jnp.where(valid_prefix[None, :, None, None], cached_k, 0)
+      cached_v = jnp.where(valid_prefix[None, :, None, None], cached_v, 0)
+
+    if self.config.use_split_attention:
+      # Return prefix and suffix KV separately — no concat. Avoids
+      # materializing the concatenated tensor in HBM.
+      return key_proj, value_proj, kv_valid_mask, cached_k, cached_v
+
+    # Default: Concatenate cached prefix KV with fresh suffix KV.
+    key_proj = jnp.concatenate([cached_k, key_proj], axis=1)
+    value_proj = jnp.concatenate([cached_v, value_proj], axis=1)
+
+    return key_proj, value_proj, kv_valid_mask, None, None
+
+  def _build_chunked_prefill_mask(
+      self,
+      attn_mask: jaxtyping.Array,
+      q_len: int,
+      kv_len: int,
+      prior_end_index: jaxtyping.Array | None,
+      kv_shared_cache: LayerCache | None,
+      prefix_length: int,
+      kv_valid_mask: jaxtyping.Array | None,
+      has_own_cache: bool,
+  ) -> jaxtyping.Array:
+    """Constructs the attention mask for chunked prefill."""
+    prefix_kv_len = kv_len - q_len
+    if (
+        self.config.use_sliding_window_kv_cache
+        and self.attn_type == AttentionType.LOCAL_SLIDING
+    ):
+      return self._build_local_chunked_prefill_mask(
+          attn_mask,
+          q_len,
+          prefix_kv_len,
+          prior_end_index,
+          kv_shared_cache,
+          prefix_length,
+          kv_valid_mask,
+          has_own_cache,
+      )
+    return self._build_global_chunked_prefill_mask(
+        attn_mask,
+        q_len,
+        kv_len,
+        prior_end_index,
+        kv_shared_cache,
+        prefix_length,
+        has_own_cache,
+    )
+
+  def _build_local_chunked_prefill_mask(
+      self,
+      attn_mask: jaxtyping.Array,
+      q_len: int,
+      prefix_kv_len: int,
+      prior_end_index: jaxtyping.Array | None,
+      kv_shared_cache: LayerCache | None,
+      prefix_length: int,
+      kv_valid_mask: jaxtyping.Array | None,
+      has_own_cache: bool,
+  ) -> jaxtyping.Array:
+    """Chunked-prefill attention mask for LOCAL_SLIDING layers."""
+    # LOCAL: Build mask over [ring_buf | suffix]
+    if kv_valid_mask is not None:
+      local_cache_mask = jnp.broadcast_to(
+          kv_valid_mask[None, None, :],
+          (attn_mask.shape[0], q_len, prefix_kv_len),
+      )
+    else:
+      local_cache_mask = jnp.ones(
+          (attn_mask.shape[0], q_len, prefix_kv_len), dtype=jnp.bool_
+      )
+    suffix_causal = attn_mask[..., -q_len:]
+    attn_mask = jnp.concatenate([local_cache_mask, suffix_causal], axis=-1)
+    # Use origin layer's prior_end_index for correct window boundaries.
+    if has_own_cache:
+      assert prior_end_index is not None
+      position_offset = prior_end_index
+      valid_cache_len = jnp.minimum(position_offset, prefix_kv_len)
+    elif kv_shared_cache is not None:
+      # Use the origin layer's prior_end_index if available (propagated
+      # via transient_kvs). Falls back to prefix_length if not present.
+      origin_end_index = kv_shared_cache.get('prior_end_index', None)
+      if origin_end_index is not None:
+        position_offset = origin_end_index
+        valid_cache_len = jnp.minimum(origin_end_index, prefix_kv_len)
+      else:
+        raise ValueError(
+            'shared LOCAL layer missing origin prior_end_index; origin layers '
+            'must propagate it via transient_kvs'
+        )
+    else:
+      position_offset = 0
+      valid_cache_len = prefix_kv_len
+    row_pos = jnp.arange(q_len) + position_offset
+    col_pos_cache = jnp.arange(prefix_kv_len) + (
+        position_offset - valid_cache_len
+    )
+    col_pos_suffix = jnp.arange(q_len) + position_offset
+    col_pos = jnp.concatenate([col_pos_cache, col_pos_suffix])
+    window_size = self.config.sliding_window_size
+    assert window_size is not None
+    sw_mask = (col_pos[None, :] > (row_pos[:, None] - window_size)) & (
+        col_pos[None, :] <= row_pos[:, None]
+    )
+    attn_mask = attn_mask & sw_mask[None, :, :]
+    return attn_mask
+
+  def _build_global_chunked_prefill_mask(
+      self,
+      attn_mask: jaxtyping.Array,
+      q_len: int,
+      kv_len: int,
+      prior_end_index: jaxtyping.Array | None,
+      kv_shared_cache: LayerCache | None,
+      prefix_length: int,
+      has_own_cache: bool,
+  ) -> jaxtyping.Array:
+    """Chunked-prefill attention mask for GLOBAL layers."""
+    # GLOBAL: Compose mask from prefix validity + suffix causal.
+    if prefix_length > 0:
+      prefix_mask = attn_mask[..., :prefix_length]
+      suffix_mask = attn_mask[..., -q_len:]
+      attn_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=-1)
+      # Mask out uninitialized prefix cache positions.
+      if has_own_cache:
+        assert prior_end_index is not None
+        prefix_valid = jnp.arange(prefix_length) < prior_end_index
+        valid_mask = jnp.concatenate(
+            [prefix_valid, jnp.ones(q_len, dtype=jnp.bool_)]
+        )
+        attn_mask = attn_mask & valid_mask[None, None, :]
+      elif kv_shared_cache is not None:
+        # Shared GLOBAL layers must also mask uninitialized prefix positions.
+        # Use the origin layer's prior_end_index propagated through
+        # kv_shared_cache.
+        origin_end_index = kv_shared_cache.get('prior_end_index', None)
+        if origin_end_index is None:
+          raise ValueError(
+              'shared GLOBAL layer missing origin prior_end_index; origin '
+              'layers must propagate it via transient_kvs'
+          )
+        prefix_valid = jnp.arange(prefix_length) < origin_end_index
+        valid_mask = jnp.concatenate(
+            [prefix_valid, jnp.ones(q_len, dtype=jnp.bool_)]
+        )
+        attn_mask = attn_mask & valid_mask[None, None, :]
+    else:
+      attn_mask = attn_mask[..., :kv_len]
+    return attn_mask
+
   def _build_flash_mask(
       self,
       q_len: int,
@@ -264,12 +684,16 @@ class Attention(nnx.Module):
       return _get_local_mask(q_len, kv_len, window_size, offset)
     return _get_causal_mask(q_len, kv_len, offset)
 
-  def _make_block_sizes(self, is_rectangular: bool) -> splash.BlockSizes:
+  def _make_block_sizes(
+      self, is_rectangular: bool, q_len: int | None = None
+  ) -> splash.BlockSizes:
     """Selects splash block sizes for this attention call."""
     # Choose block sizes. block_kv must divide kv_len.
     # For LOCAL_SLIDING rectangular shapes, block_kv must divide both
     # sliding_window_size and chunk_len. Use the smaller of the two.
     block_q = self.config.flash_attention_block_size
+    if q_len is not None:
+      block_q = min(block_q, q_len)
     if is_rectangular and self.attn_type == AttentionType.LOCAL_SLIDING:
       window_size = self.config.sliding_window_size
       assert window_size is not None
@@ -347,8 +771,8 @@ class Attention(nnx.Module):
       head_shards: int,
       q_seq_shards: int,
       mesh: shd.Mesh,
-      shd_n: str | None,
-      shd_t: str | None,
+      shd_n: AxisSpec,
+      shd_t: AxisSpec,
       save_residuals: bool = False,
   ):
     """Builds a splash MHA kernel and its manual sharding spec."""
@@ -372,6 +796,9 @@ class Attention(nnx.Module):
       attn_mask: jaxtyping.Array,
       kv_shared_cache: LayerCache | None = None,
       segment_ids: jaxtyping.Array | None = None,
+      is_chunked_prefill: bool = False,
+      prefix_length: int = 0,
+      input_mask: jaxtyping.Array | None = None,
       force_eager: bool = False,
   ) -> tuple[
       LayerCache | None,
@@ -379,6 +806,8 @@ class Attention(nnx.Module):
       tuple[
           jaxtyping.Array,
           jaxtyping.Array,
+          jaxtyping.Array | None,
+          jaxtyping.Array | None,
           jaxtyping.Array | None,
           jaxtyping.Array | None,
       ],
@@ -403,62 +832,73 @@ class Attention(nnx.Module):
     )
 
     prior_end_index = None
+    split_prefix_k = None
+    split_prefix_v = None
     if cache is not None:
       assert kv_shared_cache is None
       cache_len = cache['v'].shape[1]
       if seq_len > 1:  # prefill
-        if self.config.use_sliding_window_kv_cache and seq_len > cache_len:
-          valid_indices = (
-              (seq_len - cache_len) + jnp.arange(cache_len)
-          ) % cache_len
-          new_v = value_proj[:, -cache_len:, ...]
-          new_k = key_proj[:, -cache_len:, ...]
-          cache_v = cache['v'].at[:, valid_indices, ...].set(new_v)
-          cache_k = cache['k'].at[:, valid_indices, ...].set(new_k)
-          new_cache = {
-              'v': cache_v,
-              'k': cache_k,
-              'end_index': jnp.full(
-                  (value_proj.shape[0],), seq_len, dtype=jnp.int32
-              ),
-          }
+        (
+            new_cache,
+            key_proj,
+            value_proj,
+            kv_valid_mask,
+            prior_end_index,
+            split_prefix_k,
+            split_prefix_v,
+        ) = self._update_cache_prefill(
+            cache,
+            key_proj,
+            value_proj,
+            seq_len,
+            is_chunked_prefill=is_chunked_prefill,
+            prefix_length=prefix_length,
+            input_mask=input_mask,
+        )
+      else:  # decode
+        if (
+            self.config.use_sliding_window_kv_cache
+            and self.attn_type == AttentionType.LOCAL_SLIDING
+        ):
+          b = value_proj.shape[0]
+          cache_len_local = cache['v'].shape[1]
+          abs_slot = cache['end_index'] % cache_len_local
+          logical_pos = (
+              jnp.sum((attn_mask != 0).astype(jnp.int32), axis=-1)[:, 0] - 1
+          )
+          logical_slot = logical_pos % cache_len_local
+          has_gap = _has_physical_gap(attn_mask)[:, 0, 0]
+          slot = jnp.where(has_gap, logical_slot, abs_slot)
+          b_idx = jnp.arange(b)
+          value_proj = cache['v'].at[b_idx, slot].set(value_proj[:, 0])
+          key_proj = cache['k'].at[b_idx, slot].set(key_proj[:, 0])
         else:
-          slice_indices = (0, 0, 0, 0)
-          cache_v = jax.lax.dynamic_update_slice(
+          end_index = cache['end_index'][0]
+          slice_indices = (0, end_index % cache_len, 0, 0)
+          value_proj = jax.lax.dynamic_update_slice(
               cache['v'], value_proj, slice_indices
           )
-          cache_k = jax.lax.dynamic_update_slice(
+          key_proj = jax.lax.dynamic_update_slice(
               cache['k'], key_proj, slice_indices
           )
-          new_cache = {
-              'v': cache_v,
-              'k': cache_k,
-              'end_index': jnp.full(
-                  (value_proj.shape[0],), seq_len, dtype=jnp.int32
-              ),
-          }
-        prior_end_index = None
-        split_prefix_k = None
-        split_prefix_v = None
-      else:  # decode
-        end_index = cache['end_index'][0]
-        slice_indices = (0, end_index % cache_len, 0, 0)
-        value_proj = jax.lax.dynamic_update_slice(
-            cache['v'], value_proj, slice_indices
-        )
-        key_proj = jax.lax.dynamic_update_slice(
-            cache['k'], key_proj, slice_indices
-        )
         new_cache = {
             'v': value_proj,
             'k': key_proj,
             'end_index': cache['end_index'] + seq_len,
         }
+        split_prefix_k = None
+        split_prefix_v = None
     else:
       new_cache = {
           'v': value_proj,
           'k': key_proj,
       }
+      if kv_shared_cache is not None:
+        split_prefix_k = kv_shared_cache.get('split_prefix_k', None)
+        split_prefix_v = kv_shared_cache.get('split_prefix_v', None)
+      else:
+        split_prefix_k = None
+        split_prefix_v = None
 
     b, _, qh, _ = query_proj.shape
     _, _, kh, _ = key_proj.shape
@@ -466,12 +906,30 @@ class Attention(nnx.Module):
     # Determine if we can use flash attention for this call.
     q_len = query_proj.shape[1]
     kv_len = key_proj.shape[1]
+    # When split attention bypasses the concat, key_proj is suffix-only.
+    # Compute total kv_len from prefix + suffix for mask/guard calculations.
+    if split_prefix_k is not None:
+      kv_len = split_prefix_k.shape[1] + key_proj.shape[1]
     is_rectangular = kv_len > q_len
     use_flash = (
         self.config.use_flash_attention
         and seq_len > 1
+        # Flash attention requires kv_len >= block_kv. Fall back to eager
+        # attention for short sequences/chunks smaller than block_kv.
         and kv_len >= self.config.flash_attention_block_size
+        # segment_ids are incompatible with rectangular flash because
+        # KV segment_ids would need to cover cached prefix positions.
         and not (is_rectangular and segment_ids is not None)
+        # GLOBAL layers are flash-eligible during rectangular chunked prefill.
+        # Bucketing stabilizes kv_len across chunks, preventing the
+        # recompilation storm that originally motivated this exclusion.
+        # Partial-cache LOCAL_SLIDING chunked prefill: flash's static relative
+        # offset (kv_len - q_len) anchors the window to the padded ring length,
+        # not the valid token count, so it slides past the real cached tokens
+        # when the window is only partially filled. Fall back to eager here.
+        # See cl/933189977. Keyed on RAW (pre-bucket) prefix_length in
+        # __call__ because bucketing rounds up toward the window and hides the
+        # ring gap.
         and not force_eager
     )
 
@@ -489,7 +947,7 @@ class Attention(nnx.Module):
 
       multi_head_mask = mask_lib.MultiHeadMask([mask for _ in range(qh)])
 
-      block_sizes = self._make_block_sizes(is_rectangular)
+      block_sizes = self._make_block_sizes(is_rectangular, q_len=q_len)
 
       (
           shd_b,
@@ -513,20 +971,67 @@ class Attention(nnx.Module):
           shd_t,
       )
 
-      encoded, key_proj, value_proj = self._flash_attention_single(
-          query_proj,
-          key_proj,
-          value_proj,
-          segment_ids,
-          splash_attn_kernel,
-          kernel_spec,
-          shd_spec,
-          unsharded_seq_kv,
-          mesh,
-          shd_b,
-          shd_t,
+      # Split attention with LSE merge for chunked prefill: attend to prefix
+      # and suffix KV separately and merge via log-sum-exp, eliminating the
+      # jnp.concatenate data movement cost. Guards: block sizes must divide the
+      # prefix and suffix lengths; segment_ids are not supported (already
+      # excluded by use_flash).
+      prefix_kv_len = kv_len - q_len
+      can_split = (
+          self.config.use_split_attention
+          and is_rectangular
+          and segment_ids is None
+          and prefix_kv_len % block_sizes.block_kv == 0
+          and q_len % block_sizes.block_q == 0
       )
+      if can_split:
+        encoded, key_proj, value_proj = self._flash_attention_split(
+            query_proj,
+            key_proj,
+            value_proj,
+            split_prefix_k,
+            split_prefix_v,
+            q_len,
+            prefix_kv_len,
+            qh,
+            block_sizes,
+            head_shards,
+            q_seq_shards,
+            mesh,
+            shd_b,
+            shd_n,
+            shd_t,
+            shd_h,
+            shd_n_kv,
+            shd_spec,
+        )
+
+      else:
+        encoded, key_proj, value_proj = self._flash_attention_single(
+            query_proj,
+            key_proj,
+            value_proj,
+            split_prefix_k,
+            split_prefix_v,
+            segment_ids,
+            splash_attn_kernel,
+            kernel_spec,
+            shd_spec,
+            unsharded_seq_kv,
+            mesh,
+            shd_b,
+            shd_t,
+        )
+        split_prefix_k = None
+        split_prefix_v = None
+
     else:
+      if split_prefix_k is not None:
+        assert split_prefix_v is not None
+        key_proj = jnp.concatenate([split_prefix_k, key_proj], axis=1)
+        value_proj = jnp.concatenate([split_prefix_v, value_proj], axis=1)
+        split_prefix_k = None
+        split_prefix_v = None
       encoded = self._eager_attention(
           query_proj,
           key_proj,
@@ -535,22 +1040,177 @@ class Attention(nnx.Module):
           segment_pos,
           cache,
           kv_shared_cache,
+          kv_valid_mask,
+          prior_end_index,
+          prefix_length,
           seq_len,
+          is_chunked_prefill,
       )
 
     attn_output = self.attn_vec_einsum(encoded)
     attn_output = shard(attn_output, self.config.shd_config.act_btd)
+    if split_prefix_k is not None:
+      assert split_prefix_v is not None
+      assert split_prefix_k.ndim == 4 and key_proj.ndim == 4
+      assert split_prefix_k.shape[0] == key_proj.shape[0]
+      assert split_prefix_k.shape[2:] == key_proj.shape[2:]
     return (
         new_cache,
         attn_output,
-        (key_proj, value_proj, kv_valid_mask, prior_end_index),
+        (
+            key_proj,
+            value_proj,
+            kv_valid_mask,
+            prior_end_index,
+            split_prefix_k,
+            split_prefix_v,
+        ),
     )
+
+  def _flash_attention_split(
+      self,
+      query_proj: jaxtyping.Array,
+      key_proj: jaxtyping.Array,
+      value_proj: jaxtyping.Array,
+      split_prefix_k: jaxtyping.Array | None,
+      split_prefix_v: jaxtyping.Array | None,
+      q_len: int,
+      prefix_kv_len: int,
+      qh: int,
+      block_sizes: splash.BlockSizes,
+      head_shards: int,
+      q_seq_shards: int,
+      mesh: shd.Mesh,
+      shd_b: AxisSpec,
+      shd_n: AxisSpec,
+      shd_t: AxisSpec,
+      shd_h: AxisSpec,
+      shd_n_kv: AxisSpec,
+      shd_spec: P,
+  ) -> tuple[jaxtyping.Array, jaxtyping.Array, jaxtyping.Array]:
+    """Split-KV flash attention with LSE merge for chunked prefill."""
+    # Use separately-returned prefix KV from _read_prefix_kv. No
+    # concatenation occurred — prefix comes from cache (B, S, N, H),
+    # suffix is the fresh projection already transposed (B, N, S, H).
+    assert split_prefix_k is not None
+    assert split_prefix_v is not None
+    prefix_k = split_prefix_k.transpose(0, 2, 1, 3)
+    prefix_v = split_prefix_v.transpose(0, 2, 1, 3)
+    suffix_k = key_proj  # already transposed above
+    suffix_v = value_proj
+
+    # Build masks for prefix and suffix
+    if self.attn_type == AttentionType.LOCAL_SLIDING:
+      window_size = self.config.sliding_window_size
+      assert window_size is not None
+      sw = window_size
+      q_ids = np.arange(q_len) + prefix_kv_len
+      # Prefix mask: which prefix positions are in sliding window
+      prefix_kv_ids = np.arange(prefix_kv_len)
+      prefix_mask_2d = (prefix_kv_ids[None, :] > (q_ids[:, None] - sw)) & (
+          prefix_kv_ids[None, :] <= q_ids[:, None]
+      )
+      prefix_mask = mask_lib.NumpyMask(prefix_mask_2d.astype(np.bool_))
+      # Suffix mask: causal within chunk
+      suffix_mask = mask_lib.CausalMask((q_len, q_len))
+    else:
+      # GLOBAL: prefix is fully attended, suffix is causal
+      prefix_mask = mask_lib.FullMask((q_len, prefix_kv_len))
+      suffix_mask = mask_lib.CausalMask((q_len, q_len))
+
+    prefix_multi_mask = mask_lib.MultiHeadMask([prefix_mask for _ in range(qh)])
+    suffix_multi_mask = mask_lib.MultiHeadMask([suffix_mask for _ in range(qh)])
+
+    # Build kernels with save_residuals=True for LSE merge.
+    prefix_attn_kernel, prefix_kernel_spec = self._make_splash_kernel(
+        prefix_multi_mask,
+        block_sizes,
+        head_shards,
+        q_seq_shards,
+        mesh,
+        shd_n,
+        shd_t,
+        save_residuals=True,
+    )
+    suffix_attn_kernel, suffix_kernel_spec = self._make_splash_kernel(
+        suffix_multi_mask,
+        block_sizes,
+        head_shards,
+        q_seq_shards,
+        mesh,
+        shd_n,
+        shd_t,
+        save_residuals=True,
+    )
+
+    # Sharding specs for split KV and logsumexp
+    prefix_kv_spec = P(shd_b, shd_n_kv, None, shd_h)
+    suffix_kv_spec = P(shd_b, shd_n_kv, None, shd_h)
+    lse_spec = P(shd_b, shd_n, shd_t)
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(
+            prefix_kernel_spec,
+            shd_spec,
+            prefix_kv_spec,
+            prefix_kv_spec,
+        ),
+        out_specs=(shd_spec, (lse_spec,)),
+        check_rep=False,
+    )
+    def sharded_prefix_attn(kernel, q_block, k_block, v_block):
+      return jax.vmap(kernel)(q_block, k_block, v_block)
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(
+            suffix_kernel_spec,
+            shd_spec,
+            suffix_kv_spec,
+            suffix_kv_spec,
+        ),
+        out_specs=(shd_spec, (lse_spec,)),
+        check_rep=False,
+    )
+    def sharded_suffix_attn(kernel, q_block, k_block, v_block):
+      return jax.vmap(kernel)(q_block, k_block, v_block)
+
+    out_prefix, (lse_prefix,) = sharded_prefix_attn(
+        prefix_attn_kernel,
+        query_proj,
+        prefix_k,
+        prefix_v,
+    )
+    out_suffix, (lse_suffix,) = sharded_suffix_attn(
+        suffix_attn_kernel,
+        query_proj,
+        suffix_k,
+        suffix_v,
+    )
+
+    # Max-stabilized LSE merge (numerically stable softmax reweighting).
+    # NaN-safe: fully-masked prefix partitions arrive as out=NaN/lse=-inf and
+    # are gated to a zero contribution. See _merge_split_attention.
+    encoded = _merge_split_attention(
+        out_prefix, lse_prefix, out_suffix, lse_suffix, key_proj.dtype
+    )
+    # (B, N, T, H) -> (B, T, N, H)
+    encoded = encoded.transpose(0, 2, 1, 3)
+    # Transpose KV back for KV-sharing layers
+    key_proj = key_proj.transpose(0, 2, 1, 3)
+    value_proj = value_proj.transpose(0, 2, 1, 3)
+    return encoded, key_proj, value_proj
 
   def _flash_attention_single(
       self,
       query_proj: jaxtyping.Array,
       key_proj: jaxtyping.Array,
       value_proj: jaxtyping.Array,
+      split_prefix_k: jaxtyping.Array | None,
+      split_prefix_v: jaxtyping.Array | None,
       segment_ids: jaxtyping.Array | None,
       splash_attn_kernel: splash.SplashAttentionKernel,
       kernel_spec: splash.SplashAttentionKernel | None,
@@ -561,6 +1221,16 @@ class Attention(nnx.Module):
       shd_t: AxisSpec,
   ) -> tuple[jaxtyping.Array, jaxtyping.Array, jaxtyping.Array]:
     """Single-kernel flash attention over concatenated (or plain) KV."""
+    # Fallback: if split attention was prepared but guards failed,
+    # reconstruct the concatenated KV for single-kernel path.
+    if split_prefix_k is not None:
+      assert split_prefix_v is not None
+      key_proj = jnp.concatenate(
+          [split_prefix_k.transpose(0, 2, 1, 3), key_proj], axis=2
+      )
+      value_proj = jnp.concatenate(
+          [split_prefix_v.transpose(0, 2, 1, 3), value_proj], axis=2
+      )
     # Original single-kernel attention path.
     if segment_ids is not None:
       seg_spec = P(shd_b, shd_t)
@@ -633,7 +1303,11 @@ class Attention(nnx.Module):
       segment_pos: jaxtyping.Array,
       cache: LayerCache | None,
       kv_shared_cache: LayerCache | None,
-      seq_len: int,
+      kv_valid_mask: jaxtyping.Array | None = None,
+      prior_end_index: jaxtyping.Array | None = None,
+      prefix_length: int = 0,
+      seq_len: int = 1,
+      is_chunked_prefill: bool = False,
   ) -> jaxtyping.Array:
     """Eager einsum attention (non-flash path)."""
     if self.use_gqa:
@@ -652,9 +1326,27 @@ class Attention(nnx.Module):
     q_len = query_proj.shape[1]
 
     if seq_len > 1:
-      attn_mask = attn_mask[..., :kv_len]
+      if is_chunked_prefill and kv_len > q_len:
+        attn_mask = self._build_chunked_prefill_mask(
+            attn_mask,
+            q_len,
+            kv_len,
+            prior_end_index,
+            kv_shared_cache,
+            prefix_length,
+            kv_valid_mask,
+            has_own_cache=(cache is not None),
+        )
+      else:
+        attn_mask = attn_mask[..., :kv_len]
 
-    if self.attn_type == AttentionType.LOCAL_SLIDING:
+    _skip_sliding_mask = (
+        is_chunked_prefill
+        and kv_len > q_len
+        and self.config.use_sliding_window_kv_cache
+        and self.attn_type == AttentionType.LOCAL_SLIDING
+    )
+    if self.attn_type == AttentionType.LOCAL_SLIDING and not _skip_sliding_mask:
       window_size = self.config.sliding_window_size
       assert window_size is not None
       if segment_pos.shape[1] == 1 and self.config.use_sliding_window_kv_cache:
@@ -668,27 +1360,46 @@ class Attention(nnx.Module):
         cache_len = key_proj.shape[1]
         end_idx = active_cache['end_index']
         if cache is None:
+          # In case of shared KV cache, the origin layer already updated the
+          # end index. We need to subtract 1 to get the correct end index of
+          # the previous token.
           end_idx = end_idx - 1
-        end_idx = end_idx[:, None, None]
+        has_gap = _has_physical_gap(attn_mask)  # [B, 1, 1]
+        logical_end = jnp.sum((attn_mask != 0).astype(jnp.int32), axis=-1) - 1
+        eff_end = jnp.where(has_gap[:, :, 0], logical_end, end_idx[:, None])
+        eff_end = eff_end[:, :, None]  # [B, 1, 1]
         p = jnp.arange(cache_len)[None, None, :]
-
-        # map physical index to logical index
-        logical_indices = end_idx - ((end_idx - p) % cache_len)
-
-        # identify uninitialized slots (before the cache fills up)
+        logical_indices = eff_end - ((eff_end - p) % cache_len)
         valid_physical = logical_indices >= 0
         logical_indices = jnp.maximum(0, logical_indices)
-
-        attn_mask = jnp.take_along_axis(attn_mask, logical_indices, axis=-1)
-        attn_mask = attn_mask * valid_physical
+        gathered = jnp.take_along_axis(attn_mask, logical_indices, axis=-1)
+        contiguous_mask = gathered * valid_physical
+        attn_mask = jnp.where(
+            has_gap,
+            valid_physical.astype(contiguous_mask.dtype),
+            contiguous_mask,
+        )
       elif segment_pos.shape[1] == 1:
         # for decoding without sliding window cache
         sliding_mask = create_sliding_window_mask(
             attn_mask,
             sliding_window_size=window_size,
         )
+        # Warm-prefix chunked prefill can leave a physical gap between an
+        # element's real prompt KV and its generated tokens. The physical-slot
+        # window above assumes contiguous positions and would drop real prompt
+        # tokens once the gap >= window. Recompute the window over LOGICAL
+        # positions and select it ONLY for rows whose valid region is non-contiguous,
+        # so standard left-pad decode (contiguous -> _has_physical_gap False)
+        # is byte-identical.
+        logical_sliding_mask = create_logical_sliding_window_mask(
+            attn_mask,
+            sliding_window_size=window_size,
+        )
+        has_gap = _has_physical_gap(attn_mask)  # [B, 1, 1]
+        sliding_mask = jnp.where(has_gap, logical_sliding_mask, sliding_mask)
         attn_mask = sliding_mask * attn_mask
-      else:  # for prefill
+      else:  # standard (non-chunked) prefill sliding window
         offset = kv_len - q_len
         all_ones = jnp.ones_like(attn_mask)
         sliding_mask = jnp.triu(all_ones, offset - window_size + 1) * jnp.tril(
@@ -714,8 +1425,13 @@ class Attention(nnx.Module):
 
   @property
   def use_gqa(self) -> bool:
+    # Include MQA (num_kv_heads=1) in the GQA path. The GQA einsum
+    # correctly handles mismatched head counts via grouped reshape,
+    # whereas the non-GQA einsum ('BTNH,BSNH->BTNS') requires N to
+    # be equal between Q and K — which fails for MQA.
     return self.num_kv_heads != self.config.num_heads
 
+  @jax.named_scope('attention')
   def __call__(
       self,
       x: jaxtyping.Array,
@@ -724,6 +1440,9 @@ class Attention(nnx.Module):
       attn_mask: jaxtyping.Array,
       kv_shared_cache: LayerCache | None = None,
       segment_ids: jaxtyping.Array | None = None,
+      is_chunked_prefill: bool = False,
+      prefix_length: int = 0,
+      input_mask: jaxtyping.Array | None = None,
       force_eager: bool = False,
   ) -> tuple[
       LayerCache | None,
@@ -733,6 +1452,8 @@ class Attention(nnx.Module):
           jaxtyping.Array,
           jaxtyping.Array | None,
           jaxtyping.Array | None,
+          jaxtyping.Array | None,
+          jaxtyping.Array | None,
       ],
   ]:
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
@@ -740,23 +1461,41 @@ class Attention(nnx.Module):
         remat_config == RematConfig.BLOCK
         or remat_config == RematConfig.BLOCK.value
     ):
-      graphdef, state = nnx.split(self)
-
-      def _checkpointed_block(state, *args, **kwargs):
-        module = nnx.merge(graphdef, state)
-        return module.block(*args, **kwargs)
-
-      return jax.checkpoint(_checkpointed_block)(
-          state,
-          x,
-          segment_pos,
-          cache,
-          attn_mask,
-          kv_shared_cache,
-          segment_ids,
-          force_eager,
+      # nnx.remat needs to be applied to the unbound function and take self
+      # as the first argument. graph_updates=False prevents TraceContextError
+      # when mutating params across jax transformation trace levels.
+      # Bake static args via partial to avoid ConcretizationTypeError under remat.
+      # Bucket prefix_length to prevent a recompilation storm.
+      active_cache = cache if cache is not None else kv_shared_cache
+      bucketed_prefix = _maybe_bucket_prefix_length(
+          prefix_length,
+          active_cache,
+          is_chunked_prefill,
+          self.config.prefix_bucket_boundaries,
       )
+      block_fn = partial(
+          self.block.__func__,
+          is_chunked_prefill=is_chunked_prefill,
+          prefix_length=bucketed_prefix,
+          input_mask=input_mask,
+          force_eager=force_eager,
+      )
+      policy = getattr(jax.checkpoint_policies, self.config.remat_policy)
+      return nnx.remat(
+          block_fn,
+          graph_updates=False,
+          policy=policy,
+      )(self, x, segment_pos, cache, attn_mask, kv_shared_cache, segment_ids)
     else:
+      # Bucket prefix_length for the non-remat path too (controls static slice
+      # shapes which affect JAXPR identity).
+      active_cache = cache if cache is not None else kv_shared_cache
+      bucketed_prefix = _maybe_bucket_prefix_length(
+          prefix_length,
+          active_cache,
+          is_chunked_prefill,
+          self.config.prefix_bucket_boundaries,
+      )
       return self.block(
           x,
           segment_pos,
@@ -764,6 +1503,9 @@ class Attention(nnx.Module):
           attn_mask,
           kv_shared_cache=kv_shared_cache,
           segment_ids=segment_ids,
+          is_chunked_prefill=is_chunked_prefill,
+          prefix_length=bucketed_prefix,
+          input_mask=input_mask,
           force_eager=force_eager,
       )
 

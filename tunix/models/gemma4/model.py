@@ -17,7 +17,6 @@
 import dataclasses
 from functools import partial
 import itertools
-from typing import Any, Optional, Tuple
 from flax import nnx
 import jax
 from jax import numpy as jnp
@@ -45,7 +44,11 @@ from tunix.models.gemma4.config import (
     PreprocessedVisionInput,
     RematConfig,
     ShardingConfig,
+    _bucket_prefix_length,
+    _maybe_bucket_prefix_length,
     create_kv_cache_sharing_patterns,
+    linear_buckets,
+    pow2_buckets,
 )
 from tunix.models.gemma4.layers import (
     Einsum,
@@ -60,6 +63,8 @@ from tunix.models.gemma4.layers import (
 )
 from tunix.models.gemma4.attention import (
     Attention,
+    _has_physical_gap,
+    create_logical_sliding_window_mask,
     create_sliding_window_mask,
     find_last_one_index,
 )
@@ -126,13 +131,14 @@ class FeedForward(nnx.Module):
         remat_config == RematConfig.BLOCK
         or remat_config == RematConfig.BLOCK.value
     ):
+      policy = getattr(jax.checkpoint_policies, self.config.remat_policy)
       graphdef, state = nnx.split(self)
 
       def _checkpointed_block(state, *args, **kwargs):
         module = nnx.merge(graphdef, state)
         return module.block(*args, **kwargs)
 
-      return jax.checkpoint(_checkpointed_block)(state, x)
+      return jax.checkpoint(_checkpointed_block, policy=policy)(state, x)
     else:
       return self.block(x)
 
@@ -252,12 +258,18 @@ class DecoderLayer(nnx.Module):
       per_layer_input: jaxtyping.Array | None = None,
       kv_shared_cache: LayerCache | None = None,
       segment_ids: jaxtyping.Array | None = None,
+      is_chunked_prefill: bool = False,
+      prefix_length: int = 0,
+      input_mask: jaxtyping.Array | None = None,
+      force_eager: bool = False,
   ) -> tuple[
       LayerCache | None,
       jaxtyping.Array,
       tuple[
           jaxtyping.Array,
           jaxtyping.Array,
+          jaxtyping.Array | None,
+          jaxtyping.Array | None,
           jaxtyping.Array | None,
           jaxtyping.Array | None,
       ],
@@ -270,6 +282,10 @@ class DecoderLayer(nnx.Module):
         attn_mask,
         kv_shared_cache=kv_shared_cache,
         segment_ids=segment_ids,
+        is_chunked_prefill=is_chunked_prefill,
+        prefix_length=prefix_length,
+        input_mask=input_mask,
+        force_eager=force_eager,
     )
     attn = self.post_attention_norm(attn)
     attn += x
@@ -306,6 +322,9 @@ class DecoderLayer(nnx.Module):
       per_layer_input: jaxtyping.Array | None = None,
       kv_shared_cache: LayerCache | None = None,
       segment_ids: jaxtyping.Array | None = None,
+      is_chunked_prefill: bool = False,
+      prefix_length: int = 0,
+      input_mask: jaxtyping.Array | None = None,
   ) -> tuple[
       LayerCache | None,
       jaxtyping.Array,
@@ -314,20 +333,49 @@ class DecoderLayer(nnx.Module):
           jaxtyping.Array,
           jaxtyping.Array | None,
           jaxtyping.Array | None,
+          jaxtyping.Array | None,
+          jaxtyping.Array | None,
       ],
   ]:
+    force_eager = (
+        is_chunked_prefill
+        and self.attn.attn_type == AttentionType.LOCAL_SLIDING
+        and self.config.sliding_window_size is not None
+        and 0 < prefix_length < self.config.sliding_window_size
+    )
+    active_cache = cache if cache is not None else kv_shared_cache
+    # Bucket prefix_length to prevent a recompilation storm.
+    bucketed_prefix = _maybe_bucket_prefix_length(
+        prefix_length,
+        active_cache,
+        is_chunked_prefill,
+        self.config.prefix_bucket_boundaries,
+    )
+    # If bucket padding was introduced, force eager attention to prevent
+    # Flash Attention static masks from attending to zeroed ghost slots.
+    if is_chunked_prefill and bucketed_prefix != prefix_length:
+      force_eager = True
+
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
     if (
         remat_config == RematConfig.DECODER
         or remat_config == RematConfig.DECODER.value
     ):
+      policy = getattr(jax.checkpoint_policies, self.config.remat_policy)
       graphdef, state = nnx.split(self)
 
-      def _checkpointed_block(state, *args, **kwargs):
+      def _checkpointed_block(state, *args):
         module = nnx.merge(graphdef, state)
-        return module.block(*args, **kwargs)
+        return module.block(
+            *args,
+            segment_ids=segment_ids,
+            is_chunked_prefill=is_chunked_prefill,
+            prefix_length=bucketed_prefix,
+            input_mask=input_mask,
+            force_eager=force_eager,
+        )
 
-      return jax.checkpoint(_checkpointed_block)(
+      return jax.checkpoint(_checkpointed_block, policy=policy)(
           state,
           x,
           segment_pos,
@@ -335,7 +383,6 @@ class DecoderLayer(nnx.Module):
           attn_mask,
           per_layer_input,
           kv_shared_cache,
-          segment_ids,
       )
     else:
       return self.block(
@@ -346,10 +393,17 @@ class DecoderLayer(nnx.Module):
           per_layer_input,
           kv_shared_cache,
           segment_ids=segment_ids,
+          is_chunked_prefill=is_chunked_prefill,
+          prefix_length=bucketed_prefix,
+          input_mask=input_mask,
+          force_eager=force_eager,
       )
 
   def init_cache(self, batch_size, max_seq_len, dtype):
     return self.attn.init_cache(batch_size, max_seq_len, dtype)
+
+
+GemmaDecoderLayer = DecoderLayer
 
 
 class Gemma4(BackendMappingMixin, nnx.Module):
@@ -437,6 +491,9 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       images: PreprocessedVisionInput | None = None,
       audios: PreprocessedAudioInput | None = None,
       skip_lm_head: bool = False,
+      is_chunked_prefill: bool = False,
+      prefix_length: int = 0,
+      input_mask: jaxtyping.Array | None = None,
   ) -> tuple[jaxtyping.Array, Cache | None]:
     if positions is None:
       B, T = tokens.shape  # pylint: disable=invalid-name
@@ -496,9 +553,14 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         shared_layer_name = f'layer_{shared_idx}'
         if is_prefill:
           # During prefill, use full KV projections from the shared layer.
-          shared_k, shared_v, shared_valid_mask, origin_prior_end_index = (
-              transient_kvs[shared_layer_name]
-          )
+          (
+              shared_k,
+              shared_v,
+              shared_valid_mask,
+              origin_prior_end_index,
+              split_prefix_k,
+              split_prefix_v,
+          ) = transient_kvs[shared_layer_name]
           kv_shared_cache = {'k': shared_k, 'v': shared_v}
           if shared_valid_mask is not None:
             kv_shared_cache['valid_mask'] = shared_valid_mask
@@ -506,6 +568,10 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           # layers can mask uninitialized prefix cache positions.
           if origin_prior_end_index is not None:
             kv_shared_cache['prior_end_index'] = origin_prior_end_index
+          if split_prefix_k is not None:
+            kv_shared_cache['split_prefix_k'] = split_prefix_k
+          if split_prefix_v is not None:
+            kv_shared_cache['split_prefix_v'] = split_prefix_v
         else:
           # During decoding, use the shared layer's cache (which may be
           # an optimized sliding window ring cache).
@@ -531,6 +597,9 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           else None,
           kv_shared_cache=kv_shared_cache,
           segment_ids=segment_ids,
+          is_chunked_prefill=is_chunked_prefill,
+          prefix_length=prefix_length,
+          input_mask=input_mask,
       )
       if is_prefill and i in self.shared_layer_origins:
         transient_kvs[layer_name] = layers_kvs
