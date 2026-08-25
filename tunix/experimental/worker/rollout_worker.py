@@ -276,6 +276,18 @@ class RolloutWorker(abstract_worker.Worker):
         logprobs=logprobs,
     )
 
+  def _stamp_worker_lineage(self, metadata: dict[str, Any] | None) -> None:
+    """Appends worker generation telemetry to the lineage context if present."""
+    if metadata is None:
+      return
+    lineage_ctx = metadata.get("lineage")
+    if lineage_ctx is not None and hasattr(lineage_ctx, "add_event"):
+      lineage_ctx.add_event(
+          component="worker.rollout",
+          operation="generate",
+          attributes={"worker_id": self.worker_id},
+      )
+
   def _to_rollout_response(
       self,
       item: Any,
@@ -320,6 +332,7 @@ class RolloutWorker(abstract_worker.Worker):
       response.metadata.update(
           {k: v for k, v in extra.items() if k != "prompt_tokens"}
       )
+      self._stamp_worker_lineage(response.metadata)
       return response
     return item
 
@@ -351,6 +364,7 @@ class RolloutWorker(abstract_worker.Worker):
       )
     metadata = dict(request.metadata or {})
     metadata.setdefault("text", text)
+    self._stamp_worker_lineage(metadata)
     return datatypes.RolloutResponse(
         request_id=request.request_id or request.traj_id,
         prompt_id=request.prompt_id,
