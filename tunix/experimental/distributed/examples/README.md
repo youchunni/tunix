@@ -328,10 +328,10 @@ You can run the orchestrator and rollout workers locally using the provided laun
 
 ```shell
 # 1. Start the orchestrator locally (defaults to port 12345, waiting for 1 worker)
-bash tunix/experimental/distributed/examples/vllm_rollout/launcher.sh --role=orchestrator --local
+bash tunix/experimental/distributed/examples/vllm_rollout/launcher.sh --command=orchestrator --local
 
 # 2. In a separate terminal, start Rollout Worker 0 locally
-bash tunix/experimental/distributed/examples/vllm_rollout/launcher.sh --role=rollout --local
+bash tunix/experimental/distributed/examples/vllm_rollout/launcher.sh --command=rollout --local
 ```
 
 ### Run on Kubernetes (GKE)
@@ -340,10 +340,10 @@ To deploy the vLLM orchestrator and rollout worker JobSets (using TPU slices for
 
 ```shell
 # 1. Deploy the orchestrator JobSet
-bash tunix/experimental/distributed/examples/vllm_rollout/launcher.sh --role=orchestrator
+bash tunix/experimental/distributed/examples/vllm_rollout/launcher.sh --command=orchestrator
 
 # 2. Deploy 4 TPU-backed rollout worker JobSets (rollout-0 through rollout-3)
-bash tunix/experimental/distributed/examples/vllm_rollout/launcher.sh --role=rollout
+bash tunix/experimental/distributed/examples/vllm_rollout/launcher.sh --command=rollout
 ```
 
 ### Expected Output

@@ -285,24 +285,36 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
     if config.lora_config is not None:
       args["additional_config"]["lora_config"] = config.lora_config
 
-    tp, dp, ep = utils.resolve_parallelism_sizes(
-        mesh=config.mesh,  # pyrefly: ignore[bad-argument-type]
-        tensor_parallel_size=config.tensor_parallel_size,
-        data_parallel_size=config.data_parallel_size,
-        expert_parallel_size=config.expert_parallel_size,
-    )
-    args["tensor_parallel_size"] = tp
-    args["data_parallel_size"] = dp
+    if config.mesh:
+      tp, dp, ep = utils.resolve_parallelism_sizes(
+          mesh=config.mesh,  # pyrefly: ignore[bad-argument-type]
+          tensor_parallel_size=config.tensor_parallel_size,
+          data_parallel_size=config.data_parallel_size,
+          expert_parallel_size=config.expert_parallel_size,
+      )
+      args["tensor_parallel_size"] = tp
+      args["data_parallel_size"] = dp
 
-    assert config.mesh is not None
-    device_indexes = config.mesh.device_ids.flatten().tolist()
-    args["additional_config"]["sharding"] = {
-        "sharding_strategy": {
-            "expert_parallelism": ep,
-            "device_indexes": device_indexes,
-            "enable_dp_attention": config.enable_dp_attention,
-        }
-    }
+      assert config.mesh is not None
+      device_indexes = config.mesh.device_ids.flatten().tolist()
+      args["additional_config"]["sharding"] = {
+          "sharding_strategy": {
+              "expert_parallelism": ep,
+              "device_indexes": device_indexes,
+              "enable_dp_attention": config.enable_dp_attention,
+          }
+      }
+    else:
+      # In distributed setting, JAX backend is not initialized at this point, so
+      # we can't use mesh to resolve parallelism sizes and device indexes.
+      args["tensor_parallel_size"] = config.tensor_parallel_size
+      args["data_parallel_size"] = config.data_parallel_size
+      args["additional_config"]["sharding"] = {
+          "sharding_strategy": {
+              "expert_parallelism": config.expert_parallel_size,
+              "enable_dp_attention": config.enable_dp_attention,
+          }
+      }
 
     return args
 

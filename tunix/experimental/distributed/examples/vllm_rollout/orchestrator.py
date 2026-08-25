@@ -100,6 +100,10 @@ class RequestStatsMonitor:
         worker_stats_str = ", ".join(
             f"{wid}={cnt}" for wid, cnt in sorted(self._worker_counts.items())
         )
+        if getattr(sample_response, "turns", None):
+          text = sample_response.turns[0].action
+        else:
+          text = sample_response.metadata["text"]
         logging.info(
             "\n\n--- %d Seconds Summary ---\n"
             "\nRequests per second (RPS): %.2f\n"
@@ -111,7 +115,7 @@ class RequestStatsMonitor:
             rps,
             worker_stats_str,
             sample_request.prompt,
-            sample_response.turns[0].action.split("\n")[0] + "...",
+            text.split("\n")[0] + "...",
         )
         self._interval_requests = 0
         self._worker_counts.clear()
@@ -178,6 +182,7 @@ def orchestrator_main(
   ) as executor:
     in_flight = set()
     request_id = 0
+    dedup_error_map = {}
     while True:
       while len(in_flight) < parallelism:
         future = executor.submit(generation_task, request_id)
@@ -191,7 +196,14 @@ def orchestrator_main(
         try:
           future.result()
         except Exception as e:
-          logging.error("Generation request failed: %s", e)
+          if (
+              str(e) in dedup_error_map
+              and (dedup_error_map[str(e)] - time.time()) < 1.0
+          ):
+            pass
+          else:
+            logging.error("Generation request failed: %s", e)
+            dedup_error_map[str(e)] = time.time()
 
 
 def main(argv: Sequence[str], context: ProcessContext | None) -> None:

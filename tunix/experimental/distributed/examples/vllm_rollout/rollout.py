@@ -20,13 +20,16 @@ import logging
 import pickle
 from typing import Sequence
 
+import jax
 from transformers import AutoTokenizer  # pylint: disable=g-importing-member
 from tunix.experimental.common import test_utils as mocks
 from tunix.experimental.distributed.runtime.context import ProcessContext  # pylint: disable=g-importing-member
+from tunix.experimental.distributed.runtime.contexts.local_context import LocalProcessContext  # pylint: disable=g-importing-member
 from tunix.experimental.rl.agentic import registry
 from tunix.experimental.rollout import inprocess_vllm_sampler_adapter as inprocess_sampler_lib
 from tunix.experimental.worker import remote_execution
 from tunix.experimental.worker import rollout_worker
+from tunix.generate import tokenizer_adapter
 from tunix.generate import vllm_sampler
 
 
@@ -41,7 +44,7 @@ def main(argv: Sequence[str], context: ProcessContext | None) -> None:
   parser.add_argument(
       "--model_name",
       type=str,
-      default="Qwen/Qwen2.5-0.5B",
+      default="Qwen/Qwen3-1.7B",
       help="Name or path of the model to serve.",
   )
   parser.add_argument(
@@ -49,6 +52,12 @@ def main(argv: Sequence[str], context: ProcessContext | None) -> None:
       type=str,
       default="",
       help="Unique identifier for this rollout worker.",
+  )
+  parser.add_argument(
+      "--tensor_parallel_size",
+      type=int,
+      default=2,
+      help="Number of tensor parallel replicas.",
   )
   parser.add_argument(
       "--service_port",
@@ -62,23 +71,51 @@ def main(argv: Sequence[str], context: ProcessContext | None) -> None:
   logging.getLogger("openai").setLevel(logging.WARNING)
   logging.getLogger("httpx").setLevel(logging.WARNING)
 
+  if context and context.jax:
+    context.jax.initialize()
+
   tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-  config = vllm_sampler.VllmConfig(engine_kwargs={"model": args.model_name})
-  sampler_server = inprocess_sampler_lib.InprocessVllmSamplerAdapter(  # pyrefly: ignore[bad-instantiation]
+
+  if isinstance(context, LocalProcessContext):
+    mesh_config = [[1, args.tensor_parallel_size], ["fsdp", "tp"]]
+    mesh = jax.make_mesh(
+        *mesh_config,
+        axis_types=(jax.sharding.AxisType.Auto,) * len(mesh_config[0])
+    )
+    vllm_config = vllm_sampler.VllmConfig(
+        mesh=mesh,
+        engine_kwargs={
+            "model": args.model_name,
+            "max_model_len": 10240,
+        },
+    )
+  else:
+    vllm_config = vllm_sampler.VllmConfig(
+        server_mode=True,
+        tensor_parallel_size=args.tensor_parallel_size,
+        data_parallel_size=1,
+        engine_kwargs={
+            "model": args.model_name,
+            "max_model_len": 10240,
+            "distributed_executor_backend": "ray",
+        },
+    )
+
+  sampler_adapter = inprocess_sampler_lib.InprocessVllmSamplerAdapter(  # pyrefly: ignore[bad-instantiation]
       server_id="vllm-0",
       tokenizer=tokenizer,
-      config=config,
+      config=vllm_config,
   )
-  sampler_server.initialize()
+  sampler_adapter.initialize()
 
   worker_service = rollout_worker.RolloutWorker(
       worker_id=args.worker_id,
-      sampler=sampler_server,
+      sampler=sampler_adapter,
       env_pool=mocks.MockEnvironmentPool(
           pool_size=1, env_factory=registry.ENV_REGISTRY.get("mock_env")
       ),
       agent_factory=registry.AGENT_REGISTRY.get("mock_agent"),
-      tokenizer=tokenizer,
+      tokenizer=tokenizer_adapter.TokenizerAdapter(tokenizer),
       chat_parser=mocks.MockChatParser(),
   )
 
@@ -87,18 +124,19 @@ def main(argv: Sequence[str], context: ProcessContext | None) -> None:
     server = remote_execution.GrpcRemoteExecutionServer(worker_service)
     await server.start_serving_async(args.service_port)
 
-    if context and context.ipc and context.ipc.discovery:
-      context.ipc.discovery.register(
-          metadata=pickle.dumps({
-              "service_type": "rollout",
-              "service_port": args.service_port,
-              "worker_id": args.worker_id,
-              "model_name": args.model_name,
-          })
-      )
-
-    logging.info("rollout worker is ready at port %d.", args.service_port)
     try:
+      if context and context.ipc and context.ipc.discovery:
+        context.ipc.discovery.register(
+            metadata=pickle.dumps({
+                "service_type": "rollout",
+                "service_port": args.service_port,
+                "worker_id": args.worker_id,
+                "model_name": args.model_name,
+            })
+        )
+
+      logging.info("rollout worker is ready at port %d.", args.service_port)
+
       while True:
         await asyncio.sleep(1)
     except asyncio.CancelledError:
