@@ -19,6 +19,7 @@ from unittest import mock
 
 from absl.testing import absltest
 from tunix.experimental.common import datatypes
+from tunix.experimental.common import lineage
 from tunix.experimental.orchestrator import distributed_rl_engine
 from tunix.experimental.worker import remote_execution
 
@@ -589,6 +590,159 @@ class DistributedRLEngineTest(absltest.TestCase):
     async def _run():
       with self.assertRaisesRegex(ValueError, "lacks 'prompt_id'"):
         await self.engine.dispatch_rollouts(["raw_prompt_without_id"])
+
+    asyncio.run(_run())
+
+  def test_dispatch_rollouts_auto_stamps_lineage_context(self):
+    async def _run():
+      req_ids = await self.engine.dispatch_rollouts(
+          [{"prompt": "Hello world", "prompt_id": "prompt_42"}],
+          group_size=2,
+          policy_version=5,
+      )
+      self.assertLen(req_ids, 2)
+
+      requests = []
+      for call in self.mock_rollout_1.generate.call_args_list:
+        requests.extend(call.kwargs.get("requests", []))
+      for call in self.mock_rollout_2.generate.call_args_list:
+        requests.extend(call.kwargs.get("requests", []))
+      self.assertLen(requests, 2)
+      requests.sort(key=lambda r: r.metadata.get("pair_index", 0))
+
+      req0 = requests[0]
+      self.assertIn("lineage", req0.metadata)
+      ctx0 = req0.metadata["lineage"]
+      self.assertIsInstance(ctx0, lineage.LineageContext)
+      self.assertEqual(ctx0.tracking_id, "traj_prompt_42_0")
+      self.assertEqual(ctx0.parent_tracking_ids, ["prompt_42"])
+      self.assertLen(ctx0.events, 1)
+      self.assertEqual(ctx0.events[0].component, "engine.dispatch")
+      self.assertEqual(ctx0.events[0].operation, "rollout")
+      self.assertEqual(ctx0.events[0].attributes["policy_version"], 5)
+      self.assertEqual(ctx0.events[0].attributes["group_index"], 0)
+
+      req1 = requests[1]
+      ctx1 = req1.metadata["lineage"]
+      self.assertEqual(ctx1.tracking_id, "traj_prompt_42_1")
+      self.assertEqual(ctx1.parent_tracking_ids, ["prompt_42"])
+      self.assertEqual(ctx1.events[0].attributes["group_index"], 1)
+
+    asyncio.run(_run())
+
+  def test_poll_rollouts_forwards_lineage_to_trajectory_item(self):
+    async def _run():
+      ctx = lineage.LineageContext(
+          tracking_id="traj_p1_0", parent_tracking_ids=["p1"]
+      )
+      ctx.add_event("engine.dispatch", "rollout")
+      ctx.add_event("worker.rollout", "generate", {"worker_id": "rollout_0"})
+
+      resp = datatypes.RolloutResponse(
+          request_id="r1",
+          prompt_id="p1",
+          status="COMPLETED",
+          env_reward=1.5,
+          metadata={"lineage": ctx, "group_id": "grp1"},
+      )
+      self.mock_rollout_1.poll_responses.return_value = [resp]
+      self.mock_rollout_2.poll_responses.return_value = []
+
+      items = await self.engine.poll_rollouts()
+      self.assertLen(items, 1)
+      item = items[0]
+      self.assertIn("lineage", item.metadata)
+      self.assertIs(item.metadata["lineage"], ctx)
+      self.assertEqual(item.metadata["lineage"].tracking_id, "traj_p1_0")
+      self.assertLen(item.metadata["lineage"].events, 2)
+
+    asyncio.run(_run())
+
+  def test_dispatch_rollout_requests_preserves_existing_lineage(self):
+    async def _run():
+      custom_ctx = lineage.LineageContext(
+          tracking_id="custom_traj_id_99", parent_tracking_ids=["custom_parent"]
+      )
+      custom_ctx.add_event("custom.system", "custom_op")
+
+      req = datatypes.RolloutRequest(
+          request_id="req_custom",
+          prompt="test prompt",
+          prompt_id="prompt_custom",
+          metadata={"lineage": custom_ctx},
+      )
+      await self.engine.dispatch_rollout_requests([req])
+
+      self.assertIs(req.metadata["lineage"], custom_ctx)
+      self.assertEqual(req.metadata["lineage"].tracking_id, "custom_traj_id_99")
+      self.assertLen(req.metadata["lineage"].events, 1)
+      self.assertEqual(
+          req.metadata["lineage"].events[0].component, "custom.system"
+      )
+
+    asyncio.run(_run())
+
+  def test_dispatch_rollout_requests_handles_none_metadata(self):
+    async def _run():
+      req = datatypes.RolloutRequest(
+          request_id="req_none_meta",
+          prompt="test prompt",
+          prompt_id="p_none",
+          metadata=None,
+      )
+      await self.engine.dispatch_rollout_requests([req])
+
+      self.assertIsNotNone(req.metadata)
+      self.assertIn("lineage", req.metadata)
+      self.assertEqual(req.metadata["lineage"].tracking_id, "traj_p_none_0")
+      self.assertEqual(req.metadata["lineage"].parent_tracking_ids, ["p_none"])
+
+    asyncio.run(_run())
+
+  def test_dispatch_rollout_requests_coerces_int_prompt_id_to_str(self):
+    async def _run():
+      req = datatypes.RolloutRequest(
+          request_id="req_int_id",
+          prompt="test prompt",
+          prompt_id=42,  # pyrefly: ignore[bad-argument-type]
+          metadata={},
+      )
+      await self.engine.dispatch_rollout_requests([req])
+
+      ctx = req.metadata["lineage"]
+      self.assertEqual(ctx.tracking_id, "traj_42_0")
+      self.assertEqual(ctx.parent_tracking_ids, ["42"])
+      self.assertIsInstance(ctx.parent_tracking_ids[0], str)
+
+    asyncio.run(_run())
+
+  def test_dispatch_rollout_requests_extracts_group_offset_id(self):
+    async def _run():
+      req = datatypes.RolloutRequest(
+          request_id="req_offset",
+          prompt="test prompt",
+          prompt_id="p_offset",
+          group_offset_id="3",
+          metadata={},
+      )
+      await self.engine.dispatch_rollout_requests([req])
+
+      ctx = req.metadata["lineage"]
+      self.assertEqual(ctx.tracking_id, "traj_p_offset_3")
+      self.assertEqual(ctx.events[0].attributes["group_index"], 3)
+
+    asyncio.run(_run())
+
+  def test_dispatch_rollout_requests_raises_without_prompt_id(self):
+    async def _run():
+      req = datatypes.RolloutRequest(
+          request_id="req_no_prompt_id",
+          prompt="test prompt",
+          prompt_id="",
+          metadata={},
+      )
+      with self.assertRaisesRegex(ValueError, "lacks 'prompt_id'"):
+        await self.engine.dispatch_rollout_requests([req])
 
     asyncio.run(_run())
 

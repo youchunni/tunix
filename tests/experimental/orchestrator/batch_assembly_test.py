@@ -18,6 +18,7 @@
 from absl.testing import absltest
 import numpy as np
 from tunix.experimental.common import datatypes
+from tunix.experimental.common import lineage
 from tunix.experimental.orchestrator import batch_assembly
 from tunix.rl import common as rl_common
 
@@ -275,6 +276,122 @@ class SequencePackedBatchAssemblerTest(absltest.TestCase):
     self.assertLen(payloads, 2)
     self.assertEqual(payloads[0].token_ids.shape, (1, 12))
     self.assertEqual(payloads[1].token_ids.shape, (1, 12))
+
+  def test_sequence_packed_assembler_merges_lineage_context(self):
+    ctx1 = lineage.LineageContext(
+        tracking_id="traj_prompt_1_0",
+        parent_tracking_ids=["prompt_1"],
+    )
+    ctx1.add_event("worker.rollout", "generate")
+
+    ctx2 = lineage.LineageContext(
+        tracking_id="traj_prompt_2_0",
+        parent_tracking_ids=["prompt_2"],
+    )
+    ctx2.add_event("worker.rollout", "generate")
+
+    payload1 = datatypes.RLTrainerPayload(
+        token_ids=np.array([1, 2, 3], dtype=np.int32),
+        token_mask=np.ones(3, dtype=np.float32),
+        loss_mask=np.ones(3, dtype=np.float32),
+        advantages=np.ones(3, dtype=np.float32),
+        metadata={"lineage": ctx1},
+    )
+    payload2 = datatypes.RLTrainerPayload(
+        token_ids=np.array([4, 5, 6], dtype=np.int32),
+        token_mask=np.ones(3, dtype=np.float32),
+        loss_mask=np.ones(3, dtype=np.float32),
+        advantages=np.ones(3, dtype=np.float32),
+        metadata={"lineage": ctx2},
+    )
+
+    assembler = batch_assembly.SequencePackedBatchAssembler(max_packed_len=16)
+    payloads = assembler.pack([payload1, payload2])
+
+    self.assertLen(payloads, 1)
+    batch_lineage = payloads[0].metadata.get("lineage")
+    self.assertIsNotNone(batch_lineage)
+    self.assertIsInstance(batch_lineage, lineage.LineageContext)
+    self.assertEqual(batch_lineage.tracking_id, "batch_0")
+    self.assertEqual(
+        batch_lineage.parent_tracking_ids,
+        ["traj_prompt_1_0", "traj_prompt_2_0"],
+    )
+    self.assertLen(batch_lineage.events, 1)
+    self.assertEqual(
+        batch_lineage.events[0].component, "orchestrator.assembler"
+    )
+    self.assertEqual(batch_lineage.events[0].operation, "pack")
+    self.assertEqual(batch_lineage.events[0].attributes["bin_size"], 2)
+    self.assertEqual(
+        batch_lineage.events[0].attributes["packing_type"], "sequence_packed"
+    )
+
+  def test_sequence_packed_assembler_multiple_bins_lineage(self):
+    ctx1 = lineage.LineageContext(tracking_id="t1", parent_tracking_ids=["p1"])
+    ctx2 = lineage.LineageContext(tracking_id="t2", parent_tracking_ids=["p2"])
+    payload1 = datatypes.RLTrainerPayload(
+        token_ids=np.arange(10, dtype=np.int32),
+        token_mask=np.ones(10, dtype=np.float32),
+        loss_mask=np.ones(10, dtype=np.float32),
+        advantages=np.ones(10, dtype=np.float32),
+        metadata={"lineage": ctx1},
+    )
+    payload2 = datatypes.RLTrainerPayload(
+        token_ids=np.arange(8, dtype=np.int32),
+        token_mask=np.ones(8, dtype=np.float32),
+        loss_mask=np.ones(8, dtype=np.float32),
+        advantages=np.ones(8, dtype=np.float32),
+        metadata={"lineage": ctx2},
+    )
+
+    assembler = batch_assembly.SequencePackedBatchAssembler(max_packed_len=12)
+    payloads = assembler.pack([payload1, payload2])
+
+    self.assertLen(payloads, 2)
+    self.assertEqual(payloads[0].metadata["lineage"].tracking_id, "batch_0")
+    self.assertEqual(payloads[0].metadata["lineage"].parent_tracking_ids, ["t1"])
+    self.assertEqual(payloads[1].metadata["lineage"].tracking_id, "batch_1")
+    self.assertEqual(payloads[1].metadata["lineage"].parent_tracking_ids, ["t2"])
+
+  def test_sequence_packed_assembler_sequential_pack_monotonic_batch_ids(self):
+    ctx1 = lineage.LineageContext(tracking_id="t1", parent_tracking_ids=["p1"])
+    ctx2 = lineage.LineageContext(tracking_id="t2", parent_tracking_ids=["p2"])
+    payload1 = datatypes.RLTrainerPayload(
+        token_ids=np.array([1, 2, 3], dtype=np.int32),
+        token_mask=np.ones(3, dtype=np.float32),
+        loss_mask=np.ones(3, dtype=np.float32),
+        advantages=np.ones(3, dtype=np.float32),
+        metadata={"lineage": ctx1},
+    )
+    payload2 = datatypes.RLTrainerPayload(
+        token_ids=np.array([4, 5, 6], dtype=np.int32),
+        token_mask=np.ones(3, dtype=np.float32),
+        loss_mask=np.ones(3, dtype=np.float32),
+        advantages=np.ones(3, dtype=np.float32),
+        metadata={"lineage": ctx2},
+    )
+
+    assembler = batch_assembly.SequencePackedBatchAssembler(max_packed_len=16)
+    payloads1 = assembler.pack([payload1])
+    payloads2 = assembler.pack([payload2])
+
+    self.assertEqual(payloads1[0].metadata["lineage"].tracking_id, "batch_0")
+    self.assertEqual(payloads2[0].metadata["lineage"].tracking_id, "batch_1")
+
+  def test_sequence_packed_assembler_custom_batch_id_prefix(self):
+    ctx1 = lineage.LineageContext(tracking_id="t1", parent_tracking_ids=["p1"])
+    payload1 = datatypes.RLTrainerPayload(
+        token_ids=np.array([1, 2, 3], dtype=np.int32),
+        token_mask=np.ones(3, dtype=np.float32),
+        loss_mask=np.ones(3, dtype=np.float32),
+        advantages=np.ones(3, dtype=np.float32),
+        metadata={"lineage": ctx1},
+    )
+
+    assembler = batch_assembly.SequencePackedBatchAssembler(max_packed_len=16)
+    payloads = assembler.pack([payload1], batch_id_prefix="step_42")
+    self.assertEqual(payloads[0].metadata["lineage"].tracking_id, "step_42_0")
 
 
 class GRPOTrainExampleAssemblerTest(absltest.TestCase):
@@ -832,6 +949,94 @@ class PaddedBatchAssemblerTest(absltest.TestCase):
 
     self.assertEqual(payload.advantages.shape, (2, 5))
     np.testing.assert_allclose(payload.advantages[0], [0.0, 0.0, 0.0, 0.0, 0.0])
+
+  def test_padded_assembler_merges_lineage_context(self):
+    ctx1 = lineage.LineageContext(
+        tracking_id="traj_prompt_1_0",
+        parent_tracking_ids=["prompt_1"],
+    )
+    ctx1.add_event("worker.rollout", "generate")
+
+    ctx2 = lineage.LineageContext(
+        tracking_id="traj_prompt_2_0",
+        parent_tracking_ids=["prompt_2"],
+    )
+    ctx2.add_event("worker.rollout", "generate")
+
+    item1 = _make_payload(2, 3)
+    item1.metadata = {"lineage": ctx1}
+    item2 = _make_payload(2, 3)
+    item2.metadata = {"lineage": ctx2}
+
+    assembler = self._assembler(batch_size=2)
+    payloads = assembler.pack([item1, item2])
+
+    self.assertLen(payloads, 1)
+    batch_lineage = payloads[0].metadata.get("lineage")
+    self.assertIsNotNone(batch_lineage)
+    self.assertIsInstance(batch_lineage, lineage.LineageContext)
+    self.assertEqual(batch_lineage.tracking_id, "batch_0")
+    self.assertEqual(
+        batch_lineage.parent_tracking_ids,
+        ["traj_prompt_1_0", "traj_prompt_2_0"],
+    )
+    self.assertLen(batch_lineage.events, 1)
+    self.assertEqual(
+        batch_lineage.events[0].component, "orchestrator.assembler"
+    )
+    self.assertEqual(batch_lineage.events[0].operation, "pack")
+    self.assertEqual(batch_lineage.events[0].attributes["chunk_size"], 2)
+    self.assertEqual(batch_lineage.events[0].attributes["batch_size"], 2)
+    self.assertEqual(batch_lineage.events[0].attributes["packing_type"], "padded")
+
+  def test_padded_assembler_multiple_microbatches_lineage(self):
+    ctx1 = lineage.LineageContext(tracking_id="t1", parent_tracking_ids=["p1"])
+    ctx2 = lineage.LineageContext(tracking_id="t2", parent_tracking_ids=["p2"])
+    ctx3 = lineage.LineageContext(tracking_id="t3", parent_tracking_ids=["p3"])
+
+    item1 = _make_payload(2, 3)
+    item1.metadata = {"lineage": ctx1}
+    item2 = _make_payload(2, 3)
+    item2.metadata = {"lineage": ctx2}
+    item3 = _make_payload(2, 3)
+    item3.metadata = {"lineage": ctx3}
+
+    assembler = self._assembler(batch_size=2)
+    payloads = assembler.pack([item1, item2, item3])
+
+    self.assertLen(payloads, 2)
+    self.assertEqual(payloads[0].metadata["lineage"].tracking_id, "batch_0")
+    self.assertEqual(
+        payloads[0].metadata["lineage"].parent_tracking_ids, ["t1", "t2"]
+    )
+    self.assertEqual(payloads[1].metadata["lineage"].tracking_id, "batch_1")
+    self.assertEqual(
+        payloads[1].metadata["lineage"].parent_tracking_ids, ["t3"]
+    )
+
+  def test_padded_assembler_sequential_pack_monotonic_batch_ids(self):
+    ctx1 = lineage.LineageContext(tracking_id="t1", parent_tracking_ids=["p1"])
+    ctx2 = lineage.LineageContext(tracking_id="t2", parent_tracking_ids=["p2"])
+    item1 = _make_payload(2, 3)
+    item1.metadata = {"lineage": ctx1}
+    item2 = _make_payload(2, 3)
+    item2.metadata = {"lineage": ctx2}
+
+    assembler = self._assembler(batch_size=2)
+    payloads1 = assembler.pack([item1])
+    payloads2 = assembler.pack([item2])
+
+    self.assertEqual(payloads1[0].metadata["lineage"].tracking_id, "batch_0")
+    self.assertEqual(payloads2[0].metadata["lineage"].tracking_id, "batch_1")
+
+  def test_padded_assembler_custom_batch_id_prefix(self):
+    ctx1 = lineage.LineageContext(tracking_id="t1", parent_tracking_ids=["p1"])
+    item1 = _make_payload(2, 3)
+    item1.metadata = {"lineage": ctx1}
+
+    assembler = self._assembler(batch_size=2)
+    payloads = assembler.pack([item1], batch_id_prefix="step_10")
+    self.assertEqual(payloads[0].metadata["lineage"].tracking_id, "step_10_0")
 
 
 if __name__ == "__main__":

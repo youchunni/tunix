@@ -24,10 +24,10 @@ import collections
 from collections.abc import Mapping, Sequence
 import inspect
 from typing import Any
-import uuid
 
 import numpy as np
 from tunix.experimental.common import datatypes
+from tunix.experimental.common import lineage
 from tunix.experimental.metrics import metrics as exp_metrics
 from tunix.experimental.orchestrator import rl_engine_interface
 from tunix.experimental.worker import remote_execution
@@ -134,7 +134,35 @@ class DistributedRLEngine(rl_engine_interface.AbstractRLEngine):
   ) -> list[str]:
     """Dispatches pre-formed RolloutRequests across rollout workers using prefix routing."""
     for req in requests:
-      route_key = (req.metadata or {}).get("prefix_hash", req.prompt_id)
+      if req.metadata is None:  # pyrefly: ignore[comparison-with-never]
+        req.metadata = {}  # pyrefly: ignore[bad-assignment]
+      if req.metadata.get("lineage") is None:
+        if not req.prompt_id:
+          raise ValueError(
+              f"RolloutRequest '{req.request_id}' lacks 'prompt_id'. Every"
+              " RolloutRequest dispatched to DistributedRLEngine must provide a"
+              " non-empty 'prompt_id' for lineage tracking."
+          )
+        prompt_id = str(req.prompt_id)
+        g_idx = req.metadata.get("pair_index")
+        if g_idx is None:
+          g_idx = int(req.group_offset_id) if req.group_offset_id else 0
+        traj_tracking_id = f"traj_{prompt_id}_{g_idx}"
+        lineage_ctx = lineage.LineageContext(
+            tracking_id=traj_tracking_id,
+            parent_tracking_ids=[prompt_id],
+        )
+        lineage_ctx.add_event(
+            component="engine.dispatch",
+            operation="rollout",
+            attributes={
+                "policy_version": req.target_policy_version,
+                "group_index": g_idx,
+            },
+        )
+        req.metadata["lineage"] = lineage_ctx
+
+      route_key = req.metadata.get("prefix_hash", req.prompt_id)
       worker = self._rollout_pool._get_next_actor(
           kwargs={"route_key": route_key}
       )
@@ -390,7 +418,7 @@ class DistributedRLEngine(rl_engine_interface.AbstractRLEngine):
       raise ValueError(f"No trainer worker registered for role {role}")
     metadata = dict(getattr(payload, "metadata", {}) or {})
     request = datatypes.TrainRequest(
-        request_id=f"train_{uuid.uuid4().hex[:8]}",
+        request_id=f"train_req_{self._policy_version}",
         payload=payload,
         metadata=metadata,
     )
