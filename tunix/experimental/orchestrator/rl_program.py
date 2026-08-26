@@ -20,7 +20,7 @@ pipelines.
 
 import abc
 import asyncio
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 import dataclasses
 import time
 from typing import Any
@@ -61,6 +61,11 @@ class RLProgram(abc.ABC):
     self._is_running = False
     self._step = 0
     self.policy_version = 0
+    # Number of train steps already completed by a previous run and recovered
+    # from the trainer's checkpoint. 0 fro a fresh run. Used to skip the slice
+    # of the dataset that has already been used for training.
+    self._resumed_from_step = 0
+    self._restored_checkpoint_metadata: dict[str, Any] = {}
     self.last_step_result: RLStepResult | None = None
     self.engine: rl_engine_interface.AbstractRLEngine | None = None
 
@@ -154,6 +159,91 @@ class StandardRLProgram(RLProgram):
     ), "run_async must initialize capacity."
     await self._dispatch_capacity.acquire()
 
+  async def _resume_from_checkpoint(self) -> None:
+    """Realigns the program state with a trainer's restored checkpoint."""
+    assert self.engine is not None
+    metadata = await self.engine.restore_checkpoint(role=datatypes.Role.ACTOR)
+    if not isinstance(metadata, Mapping):
+      if metadata is not None:
+        logging.warning(
+            "restore_checkpoint returned %s, not a mapping; starting from fresh"
+            " run.",
+            type(metadata).__name__,
+        )
+      return
+    metadata = dict(metadata)
+    try:
+      restored_step = int(metadata.get("step", 0) or 0)
+    except (TypeError, ValueError):
+      logging.warning(
+          "restore_checkpoint returned a non-integer step %r; starting from"
+          " fresh run."
+      )
+      return
+    if restored_step <= 0:
+      logging.info("No checkpoint to resume from; starting from step 0.")
+      return
+
+    self._restored_checkpoint_metadata = metadata
+    self._resumed_from_step = restored_step
+    self._step = restored_step
+    self.policy_version = restored_step
+    recorded_version = metadata.get("policy_version")
+    if recorded_version is not None and recorded_version != restored_step:
+      logging.info(
+          "Checkpoint recorded mid-step policy_version=%s; resuming at the"
+          " step-boundary value %d",
+          recorded_version,
+          restored_step,
+      )
+    logging.info(
+        "Resuming from checkpoint: step=%d policy_version=%d (skipping %d)"
+        " already-trained dataset items). Metadata: %s",
+        self._step,
+        self.policy_version,
+        self._resumed_from_step * self.mini_batch_size,
+        metadata,
+    )
+    await self._resync_rollout_weights_after_resume()
+
+  async def _resync_rollout_weights_after_resume(self) -> None:
+    """Resyncs rollout worker weights after resuming from a checkpoint."""
+    if not self.sync_weights:
+      logging.warning(
+          "sync_weights is False. Resumed rollout workers will use base weights"
+          " instead of restored checkpoint version %d.",
+          self.policy_version,
+      )
+      return
+    assert self.engine is not None
+    logging.info(
+        "Resyncing rollout worker weights after resuming from checkpoint."
+    )
+    try:
+      synced_version = await self.engine.sync_weights(
+          role=datatypes.Role.ACTOR,
+          policy_version=self.policy_version,
+      )
+    except TypeError:
+      synced_version = await self.engine.sync_weights(
+          role=datatypes.Role.ACTOR
+      )
+      logging.warning(
+          "Engine doesn't accept an explicit policy_version. rollout workers"
+          " were synced as version %s instead of %d.",
+          synced_version,
+          self.policy_version,
+      )
+      return
+    if (
+        isinstance(synced_version, int)
+        and synced_version != self.policy_version
+    ):
+      raise RuntimeError(
+          "Resumed policy_version=%d does not match synced version=%d"
+          % (self.policy_version, synced_version)
+      )
+
   async def rollout_dispatch_stage(self) -> None:
     """Stage 1A: Dispatches rollout requests across workers asynchronously.
 
@@ -162,15 +252,19 @@ class StandardRLProgram(RLProgram):
     satisfying the engine's strict `prompt_id` contract.
     """
     assert self.engine is not None
-    # TODO(tunix-dev): Skip already trained datasets when resuming from
-    # checkpoints.
     if self.dataset is None:
       raise ValueError(
           "StandardRLProgram requires a dataset either at init or in run()."
       )
+    # TODO(tunix-dev): current skip logic assumes mini_batch_size is the same as
+    # global batch size. We should support the case that one global batch
+    # contains multiple mini-batches.
+    already_consumed = self._resumed_from_step * self.mini_batch_size
 
     try:
       for prompt_idx, prompt_item in enumerate(self.dataset):
+        if prompt_idx < already_consumed:
+          continue
         await self._wait_for_dispatch_window()
         if isinstance(prompt_item, dict):
           prompt_item = dict(prompt_item)
@@ -653,7 +747,11 @@ class StandardRLProgram(RLProgram):
                 role=datatypes.Role.ACTOR,
                 metadata={
                     "step": self.step + 1,
-                    "policy_version": self.policy_version,
+                    # TODO(tunix-dev): Current implementation assumes that
+                    # policy_version is the same as the step. We need to
+                    # decouple them once the global batch and mini batch
+                    # alignment is fixed.
+                    "policy_version": self.policy_version+1,
                     "num_rollouts": num_rollouts,
                     "num_microbatches": num_microbatches,
                 },
@@ -732,6 +830,10 @@ class StandardRLProgram(RLProgram):
     """Launches all stages concurrently on event loop."""
     del kwargs
     self.engine = engine
+    # Must happen before any stage starts: train_stage reads `_step` for its
+    # loop bound and rollout_dipatch_stage reads `_resumed_from_step` to skip
+    # the dataset prefix the previous run alreayd consumed.
+    await self._resume_from_checkpoint()
     logging.info("Starting StandardRLProgram concurrent stages...")
 
     max_groups_ahead = self.mini_batch_size * (self.max_staleness + 1)

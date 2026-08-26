@@ -445,6 +445,7 @@ class DistributedRLEngine(rl_engine_interface.AbstractRLEngine):
       self,
       role: datatypes.Role = datatypes.Role.ACTOR,
       target_roles: Sequence[datatypes.Role] | None = None,
+      policy_version: int | None = None,
   ) -> int:
     """Runs one weight sync round through the coordinator."""
     del role, target_roles
@@ -453,8 +454,13 @@ class DistributedRLEngine(rl_engine_interface.AbstractRLEngine):
           "sync_weights needs a coordinator; construct the engine with"
           " weight_sync_coordinator."
       )
+    target_version = (
+        self._policy_version + 1
+        if policy_version is None
+        else policy_version
+    )
     result = await self._weight_sync_coordinator.sync(
-        policy_version=self._policy_version + 1
+        policy_version=target_version
     )
     self._policy_version = result.policy_version
     return result.policy_version
@@ -472,3 +478,13 @@ class DistributedRLEngine(rl_engine_interface.AbstractRLEngine):
     return await self._invoke_worker(
         worker, "save_checkpoint", metadata=metadata, **kwargs
     )
+
+  async def restore_checkpoint(
+      self,
+      role: datatypes.Role = datatypes.Role.ACTOR,
+      **kwargs: Any,
+  ) -> Any:
+    worker = self._trainer_workers.get(role)
+    if worker is None:
+      raise ValueError(f"No trainer worker registered for role {role}")
+    return await self._invoke_worker(worker, "restore_checkpoint", **kwargs)

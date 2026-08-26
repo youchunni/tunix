@@ -43,6 +43,9 @@ EVAL_EVERY_N_STEPS=${EVAL_EVERY_N_STEPS:-1000000}
 LORA_RANK=${LORA_RANK:-16}
 LORA_ALPHA=${LORA_ALPHA:-16.0}
 USE_LORA=${USE_LORA:-0}
+CHECKPOINT_SAVE_INTERVAL_STEPS=${CHECKPOINT_SAVE_INTERVAL_STEPS:-1}
+CHECKPOINT_MAX_TO_KEEP=${CHECKPOINT_MAX_TO_KEEP:-10}
+CHECKPOINT_ROOT_DIRECTORY=${CHECKPOINT_ROOT_DIRECTORY:-"${REPO_ROOT}/checkpoints"}
 SAMPLER=${SAMPLER:-inprocess_vllm}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 WAIT_TIMEOUT_SECS=${WAIT_TIMEOUT_SECS:-1800}
@@ -307,6 +310,9 @@ echo "  response len:   $MAX_RESPONSE_LENGTH"
 echo "  train micro:    $TRAIN_MICRO_BATCH_SIZE"
 echo "  mini batch:     $MINI_BATCH_SIZE"
 echo "  use lora:       $USE_LORA"
+echo "  ckpt interval:  $CHECKPOINT_SAVE_INTERVAL_STEPS"
+echo "  ckpt max keep:  $CHECKPOINT_MAX_TO_KEEP"
+echo "  ckpt root dir:  $CHECKPOINT_ROOT_DIRECTORY"
 echo "  sampler:        $SAMPLER"
 echo "  trainer chips:  $TRAINER_TPU_CHIPS"
 echo "  rollout chips:  $ROLLOUT_TPU_CHIPS"
@@ -365,6 +371,9 @@ echo "Launching trainer node on TPU chips $TRAINER_TPU_CHIPS..."
     --eval_every_n_steps="$EVAL_EVERY_N_STEPS"
     --lora_rank="$LORA_RANK"
     --lora_alpha="$LORA_ALPHA"
+    --checkpoint_save_interval_steps="$CHECKPOINT_SAVE_INTERVAL_STEPS"
+    --checkpoint_max_to_keep="$CHECKPOINT_MAX_TO_KEEP"
+    --checkpoint_root_directory="$CHECKPOINT_ROOT_DIRECTORY"
   )
   if [[ "$USE_LORA" == "1" || "$USE_LORA" == "true" || "$USE_LORA" == "True" ]]; then
     TRAINER_CMD+=(--use_lora)

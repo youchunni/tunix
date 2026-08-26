@@ -295,6 +295,35 @@ class DistributedRLEngineTest(absltest.TestCase):
 
     asyncio.run(_run())
 
+  def test_sync_weights_honors_explicit_policy_version(self):
+    async def _run():
+      class _FakeResult:
+        policy_version = 0
+
+      class _FakeCoordinator:
+        def __init__(self):
+          self.calls = []
+
+        async def sync(self, policy_version=0, **kwargs):
+          del kwargs
+          self.calls.append(policy_version)
+          _FakeResult.policy_version = policy_version
+          return _FakeResult
+
+      coordinator = _FakeCoordinator()
+      engine = distributed_rl_engine.DistributedRLEngine(
+          rollout_workers=[self.mock_rollout_1, self.mock_rollout_2],
+          trainer_workers={datatypes.Role.ACTOR: self.mock_actor},
+          inference_workers={datatypes.Role.REFERENCE: self.mock_ref},
+          weight_sync_coordinator=coordinator,
+      )
+      # Resume: publish at the restored version, not one past it.
+      self.assertEqual(await engine.sync_weights(policy_version=5), 5)
+      self.assertEqual(await engine.sync_weights(), 6)
+      self.assertEqual(coordinator.calls, [5, 6])
+
+    asyncio.run(_run())
+
   def test_train_step_propagates_optional_kwargs(self):
     async def _run():
       self.mock_actor.fwd_bwd.return_value = {"loss": 0.5}
