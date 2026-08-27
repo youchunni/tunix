@@ -23,6 +23,7 @@ import dataclasses
 import enum
 import time
 from typing import Any, Dict
+import flax
 from jax.typing import ArrayLike  # pylint: disable=g-importing-member
 import numpy as np
 from tunix.common import datatypes as common_datatypes
@@ -476,7 +477,7 @@ class WeightSyncMetadata:
 ##### Training DTOs #####
 
 
-@dataclasses.dataclass(kw_only=True)
+@flax.struct.dataclass(frozen=True)
 class TrainerPayload:
   """Base class for generic trainer payloads.
 
@@ -497,7 +498,7 @@ class TrainerPayload:
   segment_positions: ArrayLike | None = None
 
 
-@dataclasses.dataclass(kw_only=True)
+@flax.struct.dataclass(frozen=True)
 class SFTTrainerPayload(TrainerPayload):
   """Supervised Fine-Tuning (SFT) trainer payload.
 
@@ -517,7 +518,7 @@ class SFTTrainerPayload(TrainerPayload):
 
 # TODO(tunix-dev): Introduce PPOTrainerPayload to replace generic
 # RLTrainerPayload when PPO specific fields are needed.
-@dataclasses.dataclass(kw_only=True)
+@flax.struct.dataclass(frozen=True)
 class RLTrainerPayload(TrainerPayload):
   """RL training payload.
 
@@ -539,8 +540,8 @@ class RLTrainerPayload(TrainerPayload):
     metadata: Extra payload metadata dictionary.
   """
 
-  advantages: ArrayLike
-  loss_mask: ArrayLike
+  advantages: ArrayLike | None = None
+  loss_mask: ArrayLike | None = None
   action_mask: ArrayLike | None = None
   # TODO(tunix-dev): make prompt_ids/mask and completion_ids/mask required after
   # SequencePackedBatchAssembler refactor is done.
@@ -553,7 +554,9 @@ class RLTrainerPayload(TrainerPayload):
   sampler_is_weights: ArrayLike | None = None
   returns: ArrayLike | None = None
   old_values: ArrayLike | None = None
-  metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
+  metadata: dict[str, Any] = flax.struct.field(
+      default_factory=dict, pytree_node=False
+  )
   # TODO(tunix-dev): add ppo specific fields in PPORLTrainerPayload.
 
 
